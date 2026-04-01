@@ -1,0 +1,59 @@
+{
+  "name": "md-to-ppt",
+  "version": "1.0.0",
+  "description": "Markdown 一键转 Marp PPT 桌面应用",
+  "main": "dist-electron/electron/main.js",
+  "author": "MD to PPT",
+  "license": "MIT",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "electron:dev": "vite build --watch & sleep 5 && electron .",
+    "electron:build": "vite build && npx tsc -p tsconfig.electron.json && electron-builder",
+    "preview": "vite preview"
+  },
+  "build": {
+    "appId": "com.md2ppt.app",
+    "productName": "MD to PPT",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*"
+    ],
+    "win": {
+      "target": "nsis"
+    },
+    "mac": {
+      "target": "dmg"
+    },
+    "linux": {
+      "target": "AppImage"
+    },
+    "extraMetadata": {
+      "main": "dist-electron/electron/main.js"
+    }
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.2.2",
+    "@types/node": "^25.5.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.1",
+    "autoprefixer": "^10.4.27",
+    "electron": "^41.1.0",
+    "electron-builder": "^26.8.1",
+    "postcss": "^8.5.8",
+    "tailwindcss": "^4.2.2",
+    "typescript": "^6.0.2",
+    "vite": "^8.0.3",
+    "vite-plugin-electron": "^0.29.1",
+    "vite-plugin-electron-renderer": "^0.14.6"
+  },
+  "dependencies": {
+    "openai": "^6.33.0",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4"
+  }
+}

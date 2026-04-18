@@ -30,6 +30,21 @@ interface Config {
   theme: string;
 }
 
+// 统一生成 Marp 源文件名，兼容 .md / .markdown / 无扩展名场景
+function getMarpFileName(sourceFileName: string): string {
+  const safeName = sourceFileName.trim() || "presentation.md";
+  if (/\.(md|markdown)$/i.test(safeName)) {
+    return safeName.replace(/\.(md|markdown)$/i, "_marp.md");
+  }
+  return `${safeName}_marp.md`;
+}
+
+// 统一拼接输出目录下的临时 Marp 文件路径，避免目录尾部斜杠导致双斜杠
+function buildOutputMarpPath(outputDir: string, sourceFileName: string): string {
+  const normalizedDir = outputDir.replace(/[\\/]+$/, "");
+  return `${normalizedDir}/${getMarpFileName(sourceFileName)}`;
+}
+
 function loadConfig(): Config {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
@@ -233,17 +248,19 @@ export default function App() {
       });
 
       let result = resp.choices[0]?.message?.content?.trim() ?? "";
-      for (const p of ["```markdown\n", "```marp\n", "```\n"]) {
-        if (result.startsWith(p)) { result = result.slice(p.length); break; }
-      }
+      // 兼容不同模型返回的代码块包裹格式，统一提取纯 Marp 文本
+      result = result.replace(/^```(?:markdown|md|marp)?\s*/i, "");
       if (result.endsWith("```")) result = result.slice(0, -3).trimEnd();
+      if (!result.trim()) {
+        throw new Error("模型返回内容为空，请调整提示词或模型后重试");
+      }
 
       setMarpContent(result);
       toast("转换成功！", "success");
 
       // 在 Electron 中自动保存临时文件供导出使用
       if (isElectron && config.outputDir) {
-        const tmpPath = `${config.outputDir}/${fileName.replace(/\.md$/, "_marp.md")}`;
+        const tmpPath = buildOutputMarpPath(config.outputDir, fileName);
         await electronAPI.writeFile(tmpPath, result);
         setSavedMarpPath(tmpPath);
       }
@@ -258,7 +275,7 @@ export default function App() {
   const handleSave = async () => {
     if (!marpContent) return;
     if (isElectron) {
-      const defaultName = fileName.replace(/\.md$/, "_marp.md");
+      const defaultName = getMarpFileName(fileName);
       const saved = await electronAPI.saveFile({ content: marpContent, defaultName });
       if (saved) {
         setSavedMarpPath(saved);
@@ -269,7 +286,7 @@ export default function App() {
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = fileName.replace(/\.md$/, "_marp.md") || "presentation_marp.md";
+      a.download = getMarpFileName(fileName);
       a.click();
       URL.revokeObjectURL(url);
       toast("文件已下载", "success");
@@ -277,9 +294,13 @@ export default function App() {
   };
 
   // 复制到剪贴板
-  const handleCopy = () => {
-    navigator.clipboard.writeText(marpContent);
-    toast("已复制到剪贴板", "success");
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(marpContent);
+      toast("已复制到剪贴板", "success");
+    } catch {
+      toast("复制失败，请检查系统剪贴板权限", "error");
+    }
   };
 
   // Marp 导出（仅 Electron）
@@ -292,7 +313,7 @@ export default function App() {
     // 确保有保存的临时文件
     let marpPath = savedMarpPath;
     if (!marpPath) {
-      const tmpPath = `${config.outputDir}/${fileName.replace(/\.md$/, "_marp.md") || "presentation_marp.md"}`;
+      const tmpPath = buildOutputMarpPath(config.outputDir, fileName);
       await electronAPI.writeFile(tmpPath, marpContent);
       setSavedMarpPath(tmpPath);
       marpPath = tmpPath;
@@ -325,7 +346,9 @@ export default function App() {
       <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
 
       {/* ── 顶部标题栏 ── */}
-      <header style={{
+      <header
+        className="electron-drag-region"
+        style={{
         height: 44,
         background: "var(--surface)",
         borderBottom: "1px solid var(--border)",
@@ -334,9 +357,9 @@ export default function App() {
         padding: "0 16px",
         gap: 10,
         flexShrink: 0,
-        WebkitAppRegion: "drag" as any,
-      }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 8, WebkitAppRegion: "no-drag" as any }}>
+      }}
+      >
+        <div className="electron-no-drag" style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <div style={{
             width: 26, height: 26, borderRadius: 6,
             background: "var(--primary)", display: "flex",
@@ -349,7 +372,7 @@ export default function App() {
         </div>
         <div style={{ flex: 1 }} />
         {isElectron && nodeInfo && (
-          <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: "var(--text-muted)", WebkitAppRegion: "no-drag" as any }}>
+          <div className="electron-no-drag" style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: "var(--text-muted)" }}>
             <div style={{
               width: 7, height: 7, borderRadius: "50%",
               background: nodeInfo.available ? "var(--success)" : "var(--error)",

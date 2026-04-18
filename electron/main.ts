@@ -30,7 +30,8 @@ function createWindow() {
     mainWindow.loadURL("http://localhost:5173");
     mainWindow.webContents.openDevTools();
   } else {
-    mainWindow.loadFile(path.join(__dirname, "../dist/index.html"));
+    // 生产环境下从 dist-electron/electron 回退到项目根目录，再定位到 dist/index.html
+    mainWindow.loadFile(path.join(__dirname, "../../dist/index.html"));
   }
 
   mainWindow.once("ready-to-show", () => {

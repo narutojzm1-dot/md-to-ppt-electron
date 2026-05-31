@@ -47,10 +47,31 @@ function buildOutputMarpPath(outputDir: string, sourceFileName: string): string 
 
 function cleanupMarpContent(content: string): string {
   let result = content.trim();
+  // 兼容模型把结果夹在解释文本中的情况，优先提取第一个 Markdown/Marp 代码块
+  const fenced = result.match(/```(?:markdown|md|marp)?\s*([\s\S]*?)```/i);
+  if (fenced?.[1]) result = fenced[1].trim();
   // 兼容不同模型返回的代码块包裹格式，统一提取纯 Marp 文本
   result = result.replace(/^```(?:markdown|md|marp)?\s*/i, "");
   if (result.endsWith("```")) result = result.slice(0, -3).trimEnd();
   return result;
+}
+
+function normalizeMarpContent(content: string, theme: string): { content: string; warnings: string[] } {
+  let result = cleanupMarpContent(content);
+  const warnings: string[] = [];
+  if (!/^---\s*\n[\s\S]*?marp:\s*true/im.test(result)) {
+    // 模型偶尔会漏掉 Marp frontmatter，这里自动补齐，避免导出阶段才失败
+    result = `---\nmarp: true\ntheme: ${theme || "default"}\npaginate: true\n---\n\n${result}`;
+    warnings.push("模型返回缺少 Marp 文件头，已自动补齐 frontmatter。");
+  }
+  const separatorCount = result.match(/^---\s*$/gm)?.length ?? 0;
+  if (separatorCount < 3) {
+    warnings.push("模型返回的幻灯片分页较少，建议检查内容质量或重新转换。");
+  }
+  if (!/^#\s+/m.test(result)) {
+    warnings.push("模型返回内容缺少明显标题，建议人工检查生成结果。");
+  }
+  return { content: result, warnings };
 }
 
 function getErrorMessage(err: unknown): string {
@@ -184,6 +205,21 @@ type ToastType = "success" | "error" | "info";
 interface Toast { id: number; msg: string; type: ToastType; }
 let toastId = 0;
 
+type ConvertStage = "idle" | "preparing" | "requesting" | "receiving" | "validating" | "saving" | "success" | "error";
+interface ConvertProgress {
+  stage: ConvertStage;
+  message: string;
+  percent: number;
+  startedAt: number | null;
+  finishedAt?: number;
+  error?: string;
+  warnings: string[];
+}
+
+function initialConvertProgress(): ConvertProgress {
+  return { stage: "idle", message: "等待开始转换", percent: 0, startedAt: null, warnings: [] };
+}
+
 function useToast() {
   const [toasts, setToasts] = useState<Toast[]>([]);
   const show = useCallback((msg: string, type: ToastType = "info") => {
@@ -208,8 +244,14 @@ export default function App() {
   const [isDragOver, setIsDragOver] = useState(false);
   const [nodeInfo, setNodeInfo] = useState<RuntimeCheckResult | null>(null);
   const [exportResults, setExportResults] = useState<Record<string, { success: boolean; file?: string }>>({});
+  const [convertProgress, setConvertProgress] = useState<ConvertProgress>(initialConvertProgress);
+  const [progressTick, setProgressTick] = useState(Date.now());
   const fileInputRef = useRef<HTMLInputElement>(null);
   const { toasts, show: toast } = useToast();
+
+  const updateConvertProgress = useCallback((patch: Partial<ConvertProgress>) => {
+    setConvertProgress((current) => ({ ...current, ...patch }));
+  }, []);
 
   // 持久化配置
   useEffect(() => { localStorage.setItem(STORAGE_KEY, JSON.stringify(config)); }, [config]);
@@ -226,6 +268,13 @@ export default function App() {
     }
   }, [config.outputDir, toast]);
 
+  // 转换中持续刷新耗时显示，让用户知道请求仍在进行
+  useEffect(() => {
+    if (!converting) return;
+    const timer = window.setInterval(() => setProgressTick(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [converting]);
+
   // 处理文件（来自 Electron 对话框或拖拽）
   const loadFile = useCallback((content: string, name: string) => {
     setMdContent(content);
@@ -233,6 +282,7 @@ export default function App() {
     setMarpContent("");
     setSavedMarpPath("");
     setExportResults({});
+    setConvertProgress(initialConvertProgress());
     toast(`已加载：${name}`, "success");
   }, [toast]);
 
@@ -288,9 +338,21 @@ export default function App() {
     setMarpContent("");
     setSavedMarpPath("");
     setExportResults({});
+    setConvertProgress({
+      stage: "preparing",
+      message: "正在准备请求参数...",
+      percent: 8,
+      startedAt: Date.now(),
+      warnings: [],
+    });
 
     try {
       let result = "";
+      updateConvertProgress({
+        stage: "requesting",
+        message: isElectron ? "正在通过 Electron 主进程请求 AI..." : "正在通过浏览器请求 AI...",
+        percent: 25,
+      });
       if (isElectron && electronAPI) {
         // 桌面端通过主进程请求 AI，避免浏览器 CORS 限制并减少 API Key 暴露面
         const resp = await electronAPI.generateMarp({
@@ -322,21 +384,61 @@ export default function App() {
         result = cleanupMarpContent(resp.choices[0]?.message?.content ?? "");
       }
 
+      updateConvertProgress({
+        stage: "receiving",
+        message: "已收到模型返回，正在解析内容...",
+        percent: 68,
+      });
       if (!result.trim()) {
         throw new Error("模型返回内容为空，请调整提示词或模型后重试");
       }
 
+      updateConvertProgress({
+        stage: "validating",
+        message: "正在校验 Marp 格式...",
+        percent: 82,
+      });
+      const normalized = normalizeMarpContent(result, config.theme);
+      result = normalized.content;
+
       setMarpContent(result);
-      toast("转换成功！", "success");
+      if (normalized.warnings.length > 0) {
+        toast(`转换完成，但需要检查：${normalized.warnings[0]}`, "info");
+      } else {
+        toast("转换成功！", "success");
+      }
 
       // 在 Electron 中自动保存临时文件供导出使用
       if (isElectron && electronAPI && config.outputDir) {
+        updateConvertProgress({
+          stage: "saving",
+          message: "正在保存临时 Marp 文件，供导出使用...",
+          percent: 92,
+        });
         const tmpPath = buildOutputMarpPath(config.outputDir, fileName);
         await electronAPI.writeFile(tmpPath, result);
         setSavedMarpPath(tmpPath);
       }
+      setConvertProgress((current) => ({
+        ...current,
+        stage: "success",
+        message: normalized.warnings.length > 0 ? "转换完成，但建议检查生成内容。" : "转换完成，可以保存或导出。",
+        percent: 100,
+        finishedAt: Date.now(),
+        warnings: normalized.warnings,
+        error: undefined,
+      }));
     } catch (err: unknown) {
-      toast(`转换失败：${formatConvertError(err)}`, "error");
+      const errorMessage = formatConvertError(err);
+      setConvertProgress((current) => ({
+        ...current,
+        stage: "error",
+        message: "转换失败，请根据错误详情排查。",
+        percent: Math.max(current.percent, 25),
+        finishedAt: Date.now(),
+        error: errorMessage,
+      }));
+      toast(`转换失败：${errorMessage}`, "error");
     } finally {
       setConverting(false);
     }
@@ -417,6 +519,9 @@ export default function App() {
   };
 
   const configOk = config.apiKey.trim() && config.model.trim();
+  const progressElapsedSeconds = convertProgress.startedAt
+    ? Math.max(0, Math.round(((convertProgress.finishedAt ?? progressTick) - convertProgress.startedAt) / 1000))
+    : 0;
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100vh", overflow: "hidden" }}>
@@ -696,6 +801,50 @@ export default function App() {
             >
               {converting ? <><Icon.Spin />正在转换，请稍候...</> : <><Icon.Wand />一键转换为 Marp PPT</>}
             </button>
+
+            {convertProgress.stage !== "idle" && (
+              <div style={{
+                background: "var(--surface)", border: "1px solid var(--border)",
+                borderRadius: "var(--radius)", padding: "10px 12px",
+                display: "flex", flexDirection: "column", gap: 8,
+              }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  {converting ? <Icon.Spin /> : convertProgress.stage === "error" ? <Icon.Alert /> : <Icon.Check />}
+                  <span style={{ fontWeight: 600, fontSize: 12 }}>转换进度</span>
+                  <span style={{ marginLeft: "auto", fontSize: 11, color: "var(--text-muted)" }}>
+                    {progressElapsedSeconds}s
+                  </span>
+                </div>
+                <div style={{
+                  height: 6, borderRadius: 999, background: "var(--bg)",
+                  overflow: "hidden", border: "1px solid var(--border)",
+                }}>
+                  <div style={{
+                    width: `${convertProgress.percent}%`,
+                    height: "100%",
+                    background: convertProgress.stage === "error" ? "var(--error)" : "var(--primary)",
+                    transition: "width 0.2s ease",
+                  }} />
+                </div>
+                <div style={{ fontSize: 11.5, color: "var(--text-muted)", lineHeight: 1.5 }}>
+                  {convertProgress.message}
+                </div>
+                {convertProgress.warnings.map((warning) => (
+                  <div key={warning} style={{ fontSize: 11.5, color: "var(--warning)", lineHeight: 1.5 }}>
+                    <Icon.Alert /> {warning}
+                  </div>
+                ))}
+                {convertProgress.error && (
+                  <div style={{
+                    fontSize: 11.5, color: "var(--error)", lineHeight: 1.5,
+                    background: "var(--error-bg)", borderRadius: 6, padding: "6px 8px",
+                    userSelect: "text",
+                  }}>
+                    {convertProgress.error}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         </div>
 

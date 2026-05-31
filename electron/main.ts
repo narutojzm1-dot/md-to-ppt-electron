@@ -7,8 +7,63 @@ import { promisify } from "util";
 
 const execAsync = promisify(exec);
 const isDev = process.env.NODE_ENV === "development" || !app.isPackaged;
+type ExportFormat = "pdf" | "pptx" | "html";
+
+const EXPORT_FORMATS = new Set<ExportFormat>(["pdf", "pptx", "html"]);
+const MARP_THEMES = new Set(["default", "gaia", "uncover"]);
+const allowedOutputDirs = new Set<string>();
+const allowedFiles = new Set<string>();
 
 let mainWindow: BrowserWindow | null = null;
+
+// 统一规范化路径，后续权限判断都基于绝对路径进行
+function normalizeFilePath(filePath: string): string {
+  return path.resolve(filePath);
+}
+
+// 判断目标路径是否落在用户授权过的目录内，避免渲染进程越权访问任意文件
+function isPathInsideDirectory(filePath: string, directory: string): boolean {
+  const relative = path.relative(directory, filePath);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+// 记录用户通过系统对话框明确选择过的文件
+function rememberFile(filePath: string) {
+  allowedFiles.add(normalizeFilePath(filePath));
+}
+
+// 记录用户通过系统对话框或本地持久化配置确认过的导出目录
+function rememberOutputDir(outputDir: string) {
+  allowedOutputDirs.add(normalizeFilePath(outputDir));
+}
+
+// 文件读写和系统定位操作都需要先经过授权路径校验
+function isAllowedFilePath(filePath: string): boolean {
+  const normalizedPath = normalizeFilePath(filePath);
+  if (allowedFiles.has(normalizedPath)) return true;
+  for (const outputDir of allowedOutputDirs) {
+    if (isPathInsideDirectory(normalizedPath, outputDir)) return true;
+  }
+  return false;
+}
+
+function assertAllowedFilePath(filePath: string) {
+  if (!isAllowedFilePath(filePath)) {
+    throw new Error("文件路径未经过用户授权，请重新选择文件或导出目录");
+  }
+}
+
+function assertAllowedOutputDir(outputDir: string) {
+  const normalizedDir = normalizeFilePath(outputDir);
+  if (!allowedOutputDirs.has(normalizedDir)) {
+    throw new Error("导出目录未经过用户授权，请重新选择导出目录");
+  }
+}
+
+// 临时文件清理不能影响主流程，所以这里吞掉清理失败
+function cleanupFile(filePath: string) {
+  try { fs.unlinkSync(filePath); } catch {}
+}
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -65,6 +120,7 @@ ipcMain.handle("dialog:openFile", async () => {
   });
   if (result.canceled || result.filePaths.length === 0) return null;
   const filePath = result.filePaths[0];
+  rememberFile(filePath);
   const content = fs.readFileSync(filePath, "utf-8");
   return { filePath, fileName: path.basename(filePath), content };
 });
@@ -77,6 +133,7 @@ ipcMain.handle("dialog:saveFile", async (_event, { content, defaultName }: { con
     filters: [{ name: "Markdown", extensions: ["md"] }],
   });
   if (result.canceled || !result.filePath) return null;
+  rememberFile(result.filePath);
   fs.writeFileSync(result.filePath, content, "utf-8");
   return result.filePath;
 });
@@ -88,16 +145,39 @@ ipcMain.handle("dialog:selectOutputDir", async () => {
     properties: ["openDirectory", "createDirectory"],
   });
   if (result.canceled || result.filePaths.length === 0) return null;
+  rememberOutputDir(result.filePaths[0]);
   return result.filePaths[0];
+});
+
+// ─── IPC: 重新登记已保存的导出目录 ──────────────────────────────────────────
+ipcMain.handle("fs:authorizeOutputDir", (_event, outputDir: string) => {
+  const normalizedDir = normalizeFilePath(outputDir);
+  if (!fs.existsSync(normalizedDir) || !fs.statSync(normalizedDir).isDirectory()) {
+    return false;
+  }
+  rememberOutputDir(normalizedDir);
+  return true;
 });
 
 // ─── IPC: 检查 Node.js / npx 是否可用 ──────────────────────────────────────
 ipcMain.handle("system:checkNode", async () => {
   try {
-    const { stdout } = await execAsync("node --version");
-    return { available: true, version: stdout.trim() };
-  } catch {
-    return { available: false, version: null };
+    const [{ stdout: nodeStdout }, { stdout: npxStdout }] = await Promise.all([
+      execAsync("node --version"),
+      execAsync("npx --version"),
+    ]);
+    return {
+      available: true,
+      version: nodeStdout.trim(),
+      npxVersion: npxStdout.trim(),
+    };
+  } catch (err: unknown) {
+    return {
+      available: false,
+      version: null,
+      npxVersion: null,
+      error: err instanceof Error ? err.message : String(err),
+    };
   }
 });
 
@@ -114,10 +194,19 @@ ipcMain.handle(
     }: {
       marpFilePath: string;
       outputDir: string;
-      format: "pdf" | "pptx" | "html";
+      format: ExportFormat;
       theme?: string;
     }
   ) => {
+    if (!EXPORT_FORMATS.has(format)) {
+      throw new Error(`不支持的导出格式：${format}`);
+    }
+    if (theme && !MARP_THEMES.has(theme)) {
+      throw new Error(`不支持的 Marp 主题：${theme}`);
+    }
+    assertAllowedOutputDir(outputDir);
+    assertAllowedFilePath(marpFilePath);
+
     // 写入临时文件
     const tmpFile = path.join(os.tmpdir(), `marp_input_${Date.now()}.md`);
     fs.copyFileSync(marpFilePath, tmpFile);
@@ -140,8 +229,15 @@ ipcMain.handle(
 
     return new Promise<{ success: boolean; outputFile?: string; error?: string }>(
       (resolve) => {
-        const proc = spawn("npx", args, { shell: true });
+        const npxCommand = process.platform === "win32" ? "npx.cmd" : "npx";
+        // 使用参数化 spawn，避免路径或文件名中的特殊字符被 shell 解释
+        const proc = spawn(npxCommand, args, { shell: false });
+        let stdout = "";
         let stderr = "";
+
+        proc.stdout.on("data", (data: Buffer) => {
+          stdout += data.toString();
+        });
 
         proc.stderr.on("data", (data: Buffer) => {
           stderr += data.toString();
@@ -149,16 +245,18 @@ ipcMain.handle(
 
         proc.on("close", (code) => {
           // 清理临时文件
-          try { fs.unlinkSync(tmpFile); } catch {}
+          cleanupFile(tmpFile);
 
           if (code === 0) {
+            rememberFile(outputFile);
             resolve({ success: true, outputFile });
           } else {
-            resolve({ success: false, error: stderr || `退出码 ${code}` });
+            resolve({ success: false, error: stderr || stdout || `退出码 ${code}` });
           }
         });
 
         proc.on("error", (err) => {
+          cleanupFile(tmpFile);
           resolve({ success: false, error: err.message });
         });
       }
@@ -168,16 +266,21 @@ ipcMain.handle(
 
 // ─── IPC: 在系统文件管理器中打开目录 ──────────────────────────────────────
 ipcMain.handle("shell:showItemInFolder", (_event, filePath: string) => {
+  assertAllowedFilePath(filePath);
   shell.showItemInFolder(filePath);
 });
 
 // ─── IPC: 读取文件内容 ──────────────────────────────────────────────────────
 ipcMain.handle("fs:readFile", (_event, filePath: string) => {
+  assertAllowedFilePath(filePath);
   return fs.readFileSync(filePath, "utf-8");
 });
 
 // ─── IPC: 写入文件内容 ──────────────────────────────────────────────────────
 ipcMain.handle("fs:writeFile", (_event, filePath: string, content: string) => {
+  assertAllowedFilePath(filePath);
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(filePath, content, "utf-8");
+  rememberFile(filePath);
   return true;
 });

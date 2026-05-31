@@ -10,6 +10,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
 
   // 系统检查
   checkNode: () => ipcRenderer.invoke("system:checkNode"),
+  authorizeOutputDir: (outputDir: string) =>
+    ipcRenderer.invoke("fs:authorizeOutputDir", outputDir),
 
   // Marp 导出
   marpExport: (args: {
@@ -34,7 +36,13 @@ export type ElectronAPI = {
   openFile: () => Promise<{ filePath: string; fileName: string; content: string } | null>;
   saveFile: (args: { content: string; defaultName: string }) => Promise<string | null>;
   selectOutputDir: () => Promise<string | null>;
-  checkNode: () => Promise<{ available: boolean; version: string | null }>;
+  authorizeOutputDir: (outputDir: string) => Promise<boolean>;
+  checkNode: () => Promise<{
+    available: boolean;
+    version: string | null;
+    npxVersion: string | null;
+    error?: string;
+  }>;
   marpExport: (args: {
     marpFilePath: string;
     outputDir: string;

@@ -1,6 +1,6 @@
 import { useState, useRef, useCallback, useEffect, useId } from "react";
 import OpenAI from "openai";
-import { electronAPI, isElectron, type ExportFormat } from "./lib/electronAPI";
+import { electronAPI, isElectron, type ExportFormat, type RuntimeCheckResult } from "./lib/electronAPI";
 import os from "os";
 
 // ─── Marp 转换 Prompt ────────────────────────────────────────────────────────
@@ -151,7 +151,7 @@ export default function App() {
   const [converting, setConverting] = useState(false);
   const [exporting, setExporting] = useState<ExportFormat | null>(null);
   const [isDragOver, setIsDragOver] = useState(false);
-  const [nodeInfo, setNodeInfo] = useState<{ available: boolean; version: string | null } | null>(null);
+  const [nodeInfo, setNodeInfo] = useState<RuntimeCheckResult | null>(null);
   const [exportResults, setExportResults] = useState<Record<string, { success: boolean; file?: string }>>({});
   const fileInputRef = useRef<HTMLInputElement>(null);
   const { toasts, show: toast } = useToast();
@@ -159,12 +159,17 @@ export default function App() {
   // 持久化配置
   useEffect(() => { localStorage.setItem(STORAGE_KEY, JSON.stringify(config)); }, [config]);
 
-  // 检查 Node.js 环境
+  // 检查 Node.js / npx 环境，并重新登记本地保存的导出目录
   useEffect(() => {
-    if (isElectron) {
+    if (isElectron && electronAPI) {
       electronAPI.checkNode().then(setNodeInfo);
+      if (config.outputDir) {
+        electronAPI.authorizeOutputDir(config.outputDir).then((ok) => {
+          if (!ok) toast("已保存的导出目录不可用，请重新选择", "error");
+        });
+      }
     }
-  }, []);
+  }, [config.outputDir, toast]);
 
   // 处理文件（来自 Electron 对话框或拖拽）
   const loadFile = useCallback((content: string, name: string) => {
@@ -178,7 +183,7 @@ export default function App() {
 
   // Electron 文件打开对话框
   const handleOpenFile = async () => {
-    if (isElectron) {
+    if (isElectron && electronAPI) {
       const result = await electronAPI.openFile();
       if (result) loadFile(result.content, result.fileName);
     } else {
@@ -201,7 +206,7 @@ export default function App() {
     setIsDragOver(false);
     const file = e.dataTransfer.files?.[0];
     if (!file) return;
-    if (!file.name.endsWith(".md") && !file.name.endsWith(".markdown")) {
+    if (!/\.(md|markdown)$/i.test(file.name)) {
       toast("请拖入 .md 或 .markdown 文件", "error");
       return;
     }
@@ -212,7 +217,7 @@ export default function App() {
 
   // 选择输出目录
   const handleSelectOutputDir = async () => {
-    if (isElectron) {
+    if (isElectron && electronAPI) {
       const dir = await electronAPI.selectOutputDir();
       if (dir) setConfig((c) => ({ ...c, outputDir: dir }));
     }
@@ -259,7 +264,7 @@ export default function App() {
       toast("转换成功！", "success");
 
       // 在 Electron 中自动保存临时文件供导出使用
-      if (isElectron && config.outputDir) {
+      if (isElectron && electronAPI && config.outputDir) {
         const tmpPath = buildOutputMarpPath(config.outputDir, fileName);
         await electronAPI.writeFile(tmpPath, result);
         setSavedMarpPath(tmpPath);
@@ -274,22 +279,26 @@ export default function App() {
   // 保存 Marp 源码
   const handleSave = async () => {
     if (!marpContent) return;
-    if (isElectron) {
-      const defaultName = getMarpFileName(fileName);
-      const saved = await electronAPI.saveFile({ content: marpContent, defaultName });
-      if (saved) {
-        setSavedMarpPath(saved);
-        toast(`已保存：${saved}`, "success");
+    try {
+      if (isElectron && electronAPI) {
+        const defaultName = getMarpFileName(fileName);
+        const saved = await electronAPI.saveFile({ content: marpContent, defaultName });
+        if (saved) {
+          setSavedMarpPath(saved);
+          toast(`已保存：${saved}`, "success");
+        }
+      } else {
+        const blob = new Blob([marpContent], { type: "text/markdown;charset=utf-8" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = getMarpFileName(fileName);
+        a.click();
+        URL.revokeObjectURL(url);
+        toast("文件已下载", "success");
       }
-    } else {
-      const blob = new Blob([marpContent], { type: "text/markdown;charset=utf-8" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = getMarpFileName(fileName);
-      a.click();
-      URL.revokeObjectURL(url);
-      toast("文件已下载", "success");
+    } catch (err: unknown) {
+      toast(`保存失败：${err instanceof Error ? err.message : String(err)}`, "error");
     }
   };
 
@@ -305,22 +314,22 @@ export default function App() {
 
   // Marp 导出（仅 Electron）
   const handleExport = async (format: ExportFormat) => {
-    if (!isElectron) { toast("导出功能仅在桌面版中可用", "info"); return; }
+    if (!isElectron || !electronAPI) { toast("导出功能仅在桌面版中可用", "info"); return; }
     if (!marpContent) { toast("请先完成转换", "error"); return; }
     if (!config.outputDir) { toast("请先选择输出目录", "error"); return; }
-    if (!nodeInfo?.available) { toast("未检测到 Node.js，请先安装 Node.js", "error"); return; }
-
-    // 确保有保存的临时文件
-    let marpPath = savedMarpPath;
-    if (!marpPath) {
-      const tmpPath = buildOutputMarpPath(config.outputDir, fileName);
-      await electronAPI.writeFile(tmpPath, marpContent);
-      setSavedMarpPath(tmpPath);
-      marpPath = tmpPath;
-    }
+    if (!nodeInfo?.available) { toast("未检测到 Node.js 或 npx，请先安装 Node.js", "error"); return; }
 
     setExporting(format);
     try {
+      // 确保有保存的临时文件，写入失败时会进入统一错误提示
+      let marpPath = savedMarpPath;
+      if (!marpPath) {
+        const tmpPath = buildOutputMarpPath(config.outputDir, fileName);
+        await electronAPI.writeFile(tmpPath, marpContent);
+        setSavedMarpPath(tmpPath);
+        marpPath = tmpPath;
+      }
+
       const result = await electronAPI.marpExport({
         marpFilePath: marpPath,
         outputDir: config.outputDir,
@@ -334,6 +343,8 @@ export default function App() {
       } else {
         toast(`导出失败：${result.error}`, "error");
       }
+    } catch (err: unknown) {
+      toast(`导出失败：${err instanceof Error ? err.message : String(err)}`, "error");
     } finally {
       setExporting(null);
     }
@@ -377,7 +388,7 @@ export default function App() {
               width: 7, height: 7, borderRadius: "50%",
               background: nodeInfo.available ? "var(--success)" : "var(--error)",
             }} />
-            {nodeInfo.available ? `Node.js ${nodeInfo.version}` : "未检测到 Node.js"}
+            {nodeInfo.available ? `Node.js ${nodeInfo.version} / npx ${nodeInfo.npxVersion}` : "未检测到 Node.js 或 npx"}
           </div>
         )}
       </header>
@@ -703,7 +714,7 @@ export default function App() {
                                 color: "var(--primary)", background: "none", border: "none",
                                 cursor: "pointer", textDecoration: "underline",
                               }}
-                              onClick={() => electronAPI.showItemInFolder(result.file!)}
+                              onClick={() => electronAPI?.showItemInFolder(result.file!)}
                             >
                               在文件夹中显示
                             </button>

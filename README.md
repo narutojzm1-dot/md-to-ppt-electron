@@ -44,11 +44,8 @@ pnpm dev
 ### 启动完整 Electron 开发模式
 
 ```bash
-# 终端 1：启动 Vite 开发服务器
-pnpm dev
-
-# 终端 2：启动 Electron（等待 Vite 启动后）
-npx tsc -p tsconfig.electron.json && electron .
+# 自动启动 Vite，并在开发服务器就绪后启动 Electron
+pnpm electron:dev
 ```
 
 ## 打包发布

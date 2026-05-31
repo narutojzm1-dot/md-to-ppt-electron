@@ -8,8 +8,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "electron:dev": "vite build --watch & sleep 5 && electron .",
-    "electron:build": "vite build && npx tsc -p tsconfig.electron.json && electron-builder",
+    "electron:dev": "node scripts/electron-dev.mjs",
+    "electron:build": "vite build && tsc -p tsconfig.electron.json && electron-builder",
     "preview": "vite preview"
   },
   "build": {

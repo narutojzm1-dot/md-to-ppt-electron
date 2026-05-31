@@ -10,6 +10,7 @@
     "build": "vite build",
     "electron:dev": "node scripts/electron-dev.mjs",
     "electron:build": "vite build && tsc -p tsconfig.electron.json && electron-builder",
+    "test:web": "node scripts/ui-smoke-test.mjs",
     "preview": "vite preview"
   },
   "build": {
@@ -44,6 +45,7 @@
     "autoprefixer": "^10.4.27",
     "electron": "^41.1.0",
     "electron-builder": "^26.8.1",
+    "playwright": "^1.60.0",
     "postcss": "^8.5.8",
     "tailwindcss": "^4.2.2",
     "typescript": "^6.0.2",

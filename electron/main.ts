@@ -4,6 +4,7 @@ import path from "path";
 import fs from "fs";
 import os from "os";
 import { promisify } from "util";
+import OpenAI from "openai";
 
 const execAsync = promisify(exec);
 const isDev = process.env.NODE_ENV === "development" || !app.isPackaged;
@@ -13,6 +14,22 @@ const EXPORT_FORMATS = new Set<ExportFormat>(["pdf", "pptx", "html"]);
 const MARP_THEMES = new Set(["default", "gaia", "uncover"]);
 const allowedOutputDirs = new Set<string>();
 const allowedFiles = new Set<string>();
+
+// 与渲染进程保持一致的 Marp 转换 Prompt，主进程发起请求可绕开浏览器 CORS 限制
+const MARP_PROMPT = `你是一个专业的 PPT 演示文稿策划专家和 Markdown 工程师。
+将用户提供的 Markdown 文档转换为可以直接使用 Marp 渲染的高质量演示文稿源码。
+
+【Marp 基础语法】
+- 文件头部必须包含 YAML frontmatter（marp: true, theme: default, paginate: true）
+- 使用 --- 分隔每一页幻灯片
+
+【内容转换策略】
+1. 结构化重构：H1/H2 作为幻灯片标题；标题必须是洞察或结论；每页 3-5 个核心要点；总页数 10-15 页
+2. 精准可视化：流程/架构关系用 Mermaid 代码块；数据对比保留 Markdown 表格
+3. 代码展示：保留关键代码片段，过长时保留核心逻辑并用注释省略
+4. 视觉节奏：首页封面（大标题+副标题）；第二页目录；最后一页 Q&A
+
+【输出要求】只输出 Marp Markdown 源码，不要包含任何解释性文字，不要用代码块包裹。`;
 
 let mainWindow: BrowserWindow | null = null;
 
@@ -63,6 +80,19 @@ function assertAllowedOutputDir(outputDir: string) {
 // 临时文件清理不能影响主流程，所以这里吞掉清理失败
 function cleanupFile(filePath: string) {
   try { fs.unlinkSync(filePath); } catch {}
+}
+
+function cleanupMarpContent(content: string): string {
+  let result = content.trim();
+  // 兼容不同模型返回的代码块包裹格式，统一提取纯 Marp 文本
+  result = result.replace(/^```(?:markdown|md|marp)?\s*/i, "");
+  if (result.endsWith("```")) result = result.slice(0, -3).trimEnd();
+  return result;
+}
+
+function getErrorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  return String(err);
 }
 
 function createWindow() {
@@ -180,6 +210,49 @@ ipcMain.handle("system:checkNode", async () => {
     };
   }
 });
+
+// ─── IPC: AI 转换 Markdown 为 Marp ──────────────────────────────────────────
+ipcMain.handle(
+  "ai:generateMarp",
+  async (
+    _event,
+    {
+      apiKey,
+      baseUrl,
+      model,
+      markdown,
+    }: {
+      apiKey: string;
+      baseUrl?: string;
+      model: string;
+      markdown: string;
+    }
+  ) => {
+    try {
+      const clientOpts: ConstructorParameters<typeof OpenAI>[0] = { apiKey };
+      if (baseUrl?.trim()) clientOpts.baseURL = baseUrl.trim().replace(/\/$/, "");
+
+      const client = new OpenAI(clientOpts);
+      const resp = await client.chat.completions.create({
+        model: model.trim(),
+        messages: [
+          { role: "system", content: MARP_PROMPT },
+          { role: "user", content: markdown },
+        ],
+        temperature: 0.7,
+        max_tokens: 4096,
+      });
+
+      const content = cleanupMarpContent(resp.choices[0]?.message?.content ?? "");
+      if (!content.trim()) {
+        return { success: false, error: "模型返回内容为空，请检查模型 ID 或调整输入内容后重试" };
+      }
+      return { success: true, content };
+    } catch (err: unknown) {
+      return { success: false, error: getErrorMessage(err) };
+    }
+  }
+);
 
 // ─── IPC: 调用 Marp CLI 导出 ────────────────────────────────────────────────
 ipcMain.handle(

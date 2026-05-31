@@ -12,6 +12,12 @@ export interface MarpExportResult {
   error?: string;
 }
 
+export interface GenerateMarpResult {
+  success: boolean;
+  content?: string;
+  error?: string;
+}
+
 export interface RuntimeCheckResult {
   available: boolean;
   version: string | null;
@@ -26,6 +32,12 @@ export interface ElectronAPI {
   selectOutputDir: () => Promise<string | null>;
   authorizeOutputDir: (outputDir: string) => Promise<boolean>;
   checkNode: () => Promise<RuntimeCheckResult>;
+  generateMarp: (args: {
+    apiKey: string;
+    baseUrl?: string;
+    model: string;
+    markdown: string;
+  }) => Promise<GenerateMarpResult>;
   marpExport: (args: {
     marpFilePath: string;
     outputDir: string;

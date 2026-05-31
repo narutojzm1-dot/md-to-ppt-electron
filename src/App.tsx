@@ -45,6 +45,27 @@ function buildOutputMarpPath(outputDir: string, sourceFileName: string): string 
   return `${normalizedDir}/${getMarpFileName(sourceFileName)}`;
 }
 
+function cleanupMarpContent(content: string): string {
+  let result = content.trim();
+  // 兼容不同模型返回的代码块包裹格式，统一提取纯 Marp 文本
+  result = result.replace(/^```(?:markdown|md|marp)?\s*/i, "");
+  if (result.endsWith("```")) result = result.slice(0, -3).trimEnd();
+  return result;
+}
+
+function getErrorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  return String(err);
+}
+
+function formatConvertError(err: unknown): string {
+  const message = getErrorMessage(err);
+  if (/failed to fetch|networkerror|cors|load failed/i.test(message)) {
+    return `${message}。当前 Web 预览是浏览器直连接口，可能被供应商 CORS 策略拦截；请使用桌面 Electron 模式，或确认供应商允许浏览器跨域调用。`;
+  }
+  return message;
+}
+
 function loadConfig(): Config {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
@@ -235,27 +256,38 @@ export default function App() {
     setExportResults({});
 
     try {
-      const clientOpts: ConstructorParameters<typeof OpenAI>[0] = {
-        apiKey: config.apiKey,
-        dangerouslyAllowBrowser: true,
-      };
-      if (config.baseUrl.trim()) clientOpts.baseURL = config.baseUrl.trim().replace(/\/$/, "");
+      let result = "";
+      if (isElectron && electronAPI) {
+        // 桌面端通过主进程请求 AI，避免浏览器 CORS 限制并减少 API Key 暴露面
+        const resp = await electronAPI.generateMarp({
+          apiKey: config.apiKey,
+          baseUrl: config.baseUrl.trim() || undefined,
+          model: config.model.trim(),
+          markdown: mdContent,
+        });
+        if (!resp.success) throw new Error(resp.error || "AI 转换失败");
+        result = resp.content ?? "";
+      } else {
+        // Web 预览只能浏览器直连接口，部分供应商会因为 CORS 拒绝请求
+        const clientOpts: ConstructorParameters<typeof OpenAI>[0] = {
+          apiKey: config.apiKey,
+          dangerouslyAllowBrowser: true,
+        };
+        if (config.baseUrl.trim()) clientOpts.baseURL = config.baseUrl.trim().replace(/\/$/, "");
 
-      const client = new OpenAI(clientOpts);
-      const resp = await client.chat.completions.create({
-        model: config.model.trim(),
-        messages: [
-          { role: "system", content: MARP_PROMPT },
-          { role: "user", content: mdContent },
-        ],
-        temperature: 0.7,
-        max_tokens: 4096,
-      });
+        const client = new OpenAI(clientOpts);
+        const resp = await client.chat.completions.create({
+          model: config.model.trim(),
+          messages: [
+            { role: "system", content: MARP_PROMPT },
+            { role: "user", content: mdContent },
+          ],
+          temperature: 0.7,
+          max_tokens: 4096,
+        });
+        result = cleanupMarpContent(resp.choices[0]?.message?.content ?? "");
+      }
 
-      let result = resp.choices[0]?.message?.content?.trim() ?? "";
-      // 兼容不同模型返回的代码块包裹格式，统一提取纯 Marp 文本
-      result = result.replace(/^```(?:markdown|md|marp)?\s*/i, "");
-      if (result.endsWith("```")) result = result.slice(0, -3).trimEnd();
       if (!result.trim()) {
         throw new Error("模型返回内容为空，请调整提示词或模型后重试");
       }
@@ -270,7 +302,7 @@ export default function App() {
         setSavedMarpPath(tmpPath);
       }
     } catch (err: unknown) {
-      toast(`转换失败：${err instanceof Error ? err.message : String(err)}`, "error");
+      toast(`转换失败：${formatConvertError(err)}`, "error");
     } finally {
       setConverting(false);
     }
@@ -539,6 +571,17 @@ export default function App() {
               {configOk ? <Icon.Check /> : <Icon.Alert />}
               {configOk ? "配置完成，可以开始转换" : "请填写 API Key 和模型 ID"}
             </div>
+
+            {!isElectron && (
+              <div style={{
+                display: "flex", alignItems: "flex-start", gap: 6,
+                padding: "8px 10px", borderRadius: 6, fontSize: 11.5,
+                background: "var(--warning-bg)", color: "var(--warning)",
+              }}>
+                <Icon.Alert />
+                <span>当前是 Web 预览，AI 请求会受浏览器 CORS 限制；桌面版会通过主进程请求，更适合完整测试。</span>
+              </div>
+            )}
           </div>
         </aside>
 

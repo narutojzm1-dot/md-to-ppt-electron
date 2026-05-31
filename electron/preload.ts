@@ -14,6 +14,12 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.invoke("fs:authorizeOutputDir", outputDir),
 
   // Marp 导出
+  generateMarp: (args: {
+    apiKey: string;
+    baseUrl?: string;
+    model: string;
+    markdown: string;
+  }) => ipcRenderer.invoke("ai:generateMarp", args),
   marpExport: (args: {
     marpFilePath: string;
     outputDir: string;
@@ -43,6 +49,12 @@ export type ElectronAPI = {
     npxVersion: string | null;
     error?: string;
   }>;
+  generateMarp: (args: {
+    apiKey: string;
+    baseUrl?: string;
+    model: string;
+    markdown: string;
+  }) => Promise<{ success: boolean; content?: string; error?: string }>;
   marpExport: (args: {
     marpFilePath: string;
     outputDir: string;

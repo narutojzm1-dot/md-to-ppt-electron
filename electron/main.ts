@@ -22,6 +22,7 @@ const MARP_PROMPT = `你是一个专业的 PPT 演示文稿策划专家和 Markd
 【Marp 基础语法】
 - 文件头部必须包含 YAML frontmatter（marp: true, theme: default, paginate: true）
 - 使用 --- 分隔每一页幻灯片
+- Mermaid 必须写成 \`\`\`mermaid 代码块，不能直接输出裸 graph/flowchart 文本
 
 【内容转换策略】
 1. 结构化重构：H1/H2 作为幻灯片标题；标题必须是洞察或结论；每页 3-5 个核心要点；总页数 10-15 页
@@ -29,7 +30,10 @@ const MARP_PROMPT = `你是一个专业的 PPT 演示文稿策划专家和 Markd
 3. 代码展示：保留关键代码片段，过长时保留核心逻辑并用注释省略
 4. 视觉节奏：首页封面（大标题+副标题）；第二页目录；最后一页 Q&A
 
-【输出要求】只输出 Marp Markdown 源码，不要包含任何解释性文字，不要用代码块包裹。`;
+【输出要求】
+- 只输出 Marp Markdown 源码，不要包含任何解释性文字，不要用代码块包裹整个文档
+- 必须生成完整幻灯片，而不是摘要、提纲或单个 Mermaid 图
+- 每页必须有标题，至少 8 页，使用 --- 分页。`;
 
 let mainWindow: BrowserWindow | null = null;
 

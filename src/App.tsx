@@ -10,6 +10,7 @@ const MARP_PROMPT = `你是一个专业的 PPT 演示文稿策划专家和 Markd
 【Marp 基础语法】
 - 文件头部必须包含 YAML frontmatter（marp: true, theme: default, paginate: true）
 - 使用 --- 分隔每一页幻灯片
+- Mermaid 必须写成 \`\`\`mermaid 代码块，不能直接输出裸 graph/flowchart 文本
 
 【内容转换策略】
 1. 结构化重构：H1/H2 作为幻灯片标题；标题必须是洞察或结论；每页 3-5 个核心要点；总页数 10-15 页
@@ -17,7 +18,10 @@ const MARP_PROMPT = `你是一个专业的 PPT 演示文稿策划专家和 Markd
 3. 代码展示：保留关键代码片段，过长时保留核心逻辑并用注释省略
 4. 视觉节奏：首页封面（大标题+副标题）；第二页目录；最后一页 Q&A
 
-【输出要求】只输出 Marp Markdown 源码，不要包含任何解释性文字，不要用代码块包裹。`;
+【输出要求】
+- 只输出 Marp Markdown 源码，不要包含任何解释性文字，不要用代码块包裹整个文档
+- 必须生成完整幻灯片，而不是摘要、提纲或单个 Mermaid 图
+- 每页必须有标题，至少 8 页，使用 --- 分页。`;
 
 // ─── 本地存储 ────────────────────────────────────────────────────────────────
 const STORAGE_KEY = "md2ppt_electron_config";
@@ -56,9 +60,10 @@ function cleanupMarpContent(content: string): string {
   return result;
 }
 
-function normalizeMarpContent(content: string, theme: string): { content: string; warnings: string[] } {
+function normalizeMarpContent(content: string, theme: string): { content: string; warnings: string[]; errors: string[] } {
   let result = cleanupMarpContent(content);
   const warnings: string[] = [];
+  const errors: string[] = [];
   if (!/^---\s*\n[\s\S]*?marp:\s*true/im.test(result)) {
     // 模型偶尔会漏掉 Marp frontmatter，这里自动补齐，避免导出阶段才失败
     result = `---\nmarp: true\ntheme: ${theme || "default"}\npaginate: true\n---\n\n${result}`;
@@ -66,12 +71,15 @@ function normalizeMarpContent(content: string, theme: string): { content: string
   }
   const separatorCount = result.match(/^---\s*$/gm)?.length ?? 0;
   if (separatorCount < 3) {
-    warnings.push("模型返回的幻灯片分页较少，建议检查内容质量或重新转换。");
+    errors.push("模型没有生成完整幻灯片分页，只返回了零散内容；请重新转换或更换模型。");
   }
   if (!/^#\s+/m.test(result)) {
-    warnings.push("模型返回内容缺少明显标题，建议人工检查生成结果。");
+    errors.push("模型返回内容缺少幻灯片标题，不像可直接导出的 PPT 源码。");
   }
-  return { content: result, warnings };
+  if (/\b(graph|flowchart|sequenceDiagram|classDiagram|stateDiagram|erDiagram)\b/i.test(result) && !/```mermaid/i.test(result)) {
+    errors.push("检测到裸 Mermaid 图内容，但没有使用 ```mermaid 代码块包裹，Marp 渲染可能失败。");
+  }
+  return { content: result, warnings, errors };
 }
 
 function getErrorMessage(err: unknown): string {
@@ -402,6 +410,19 @@ export default function App() {
       result = normalized.content;
 
       setMarpContent(result);
+      if (normalized.errors.length > 0) {
+        setConvertProgress((current) => ({
+          ...current,
+          stage: "error",
+          message: "模型返回了内容，但未通过 PPT 源码质量检查。",
+          percent: 100,
+          finishedAt: Date.now(),
+          warnings: normalized.warnings,
+          error: normalized.errors.join(" "),
+        }));
+        toast(`生成结果不可直接导出：${normalized.errors[0]}`, "error");
+        return;
+      }
       if (normalized.warnings.length > 0) {
         toast(`转换完成，但需要检查：${normalized.warnings[0]}`, "info");
       } else {
@@ -484,6 +505,7 @@ export default function App() {
   const handleExport = async (format: ExportFormat) => {
     if (!isElectron || !electronAPI) { toast("导出功能仅在桌面版中可用", "info"); return; }
     if (!marpContent) { toast("请先完成转换", "error"); return; }
+    if (convertProgress.stage === "error") { toast("当前生成结果未通过质量检查，请重新转换后再导出", "error"); return; }
     if (!config.outputDir) { toast("请先选择输出目录", "error"); return; }
     if (!nodeInfo?.available) { toast("未检测到 Node.js 或 npx，请先安装 Node.js", "error"); return; }
 
@@ -859,7 +881,11 @@ export default function App() {
           }}>
             <Icon.Code />
             <span style={{ fontWeight: 600, fontSize: 13 }}>Marp 源码输出</span>
-            {marpContent && <span className="badge badge-green">已生成</span>}
+            {marpContent && (
+              <span className={convertProgress.stage === "error" ? "badge badge-orange" : "badge badge-green"}>
+                {convertProgress.stage === "error" ? "需重试" : "已生成"}
+              </span>
+            )}
             <div style={{ flex: 1 }} />
             {marpContent && (
               <>
@@ -874,6 +900,24 @@ export default function App() {
           </div>
 
           <div style={{ flex: 1, padding: 10, overflow: "hidden", display: "flex", flexDirection: "column", gap: 8 }}>
+            {marpContent && (
+              <div style={{
+                background: convertProgress.stage === "error" ? "var(--error-bg)" : "var(--success-bg)",
+                border: `1px solid ${convertProgress.stage === "error" ? "rgba(220,38,38,0.25)" : "rgba(5,150,105,0.25)"}`,
+                borderRadius: "var(--radius)", padding: "8px 10px",
+                fontSize: 11.5, lineHeight: 1.55,
+                color: convertProgress.stage === "error" ? "var(--error)" : "var(--success)",
+              }}>
+                <strong>这不是最终 PPT 文件。</strong>
+                这里显示的是 Marp Markdown 源码：它应该包含 frontmatter、多个 `---` 分页、每页标题和正文。
+                {convertProgress.stage === "error"
+                  ? " 当前结果没有通过质量检查，建议重新转换或换模型。"
+                  : isElectron
+                    ? " 检查无误后可点击下方 PDF/PPTX/HTML 导出。"
+                    : " Web 预览只能复制命令手动渲染，桌面版可一键导出。"}
+              </div>
+            )}
+
             {!marpContent ? (
               <div style={{
                 flex: 1, border: "1px dashed var(--border)", borderRadius: "var(--radius)",
@@ -928,7 +972,7 @@ export default function App() {
                               color: result?.success ? "var(--success)" : undefined,
                             }}
                             onClick={() => handleExport(fmt)}
-                            disabled={exporting !== null || !config.outputDir}
+                            disabled={exporting !== null || !config.outputDir || convertProgress.stage === "error"}
                           >
                             {exporting === fmt ? <Icon.Spin /> : result?.success ? <Icon.Check /> : <Icon.Download />}
                             {fmt.toUpperCase()}

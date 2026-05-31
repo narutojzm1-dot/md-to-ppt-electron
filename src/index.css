@@ -211,6 +211,11 @@ input, textarea {
   color: var(--text-muted);
 }
 
+.badge-orange {
+  background: var(--warning-bg);
+  color: var(--warning);
+}
+
 /* Electron 标题栏拖拽区域，避免在 TS 内联样式中使用 WebkitAppRegion 触发类型问题 */
 .electron-drag-region {
   -webkit-app-region: drag;

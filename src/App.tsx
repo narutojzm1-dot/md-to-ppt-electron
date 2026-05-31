@@ -58,12 +58,44 @@ function getErrorMessage(err: unknown): string {
   return String(err);
 }
 
+function getApiErrorField(err: unknown, field: string): unknown {
+  if (!err || typeof err !== "object") return undefined;
+  const record = err as Record<string, unknown>;
+  if (record[field] !== undefined) return record[field];
+  const nested = record.error;
+  if (nested && typeof nested === "object") {
+    return (nested as Record<string, unknown>)[field];
+  }
+  return undefined;
+}
+
 function formatConvertError(err: unknown): string {
   const message = getErrorMessage(err);
+  const status = getApiErrorField(err, "status") ?? getApiErrorField(err, "statusCode");
+  const code = getApiErrorField(err, "code");
+  const type = getApiErrorField(err, "type");
+  const statusText = typeof status === "number" || typeof status === "string" ? String(status) : "";
+  const codeText = typeof code === "string" ? code : "";
+  const typeText = typeof type === "string" ? type : "";
+  const meta = [statusText && `HTTP ${statusText}`, codeText && `code=${codeText}`, typeText && `type=${typeText}`]
+    .filter(Boolean)
+    .join(", ");
+  const haystack = `${statusText} ${codeText} ${typeText} ${message}`;
+
+  // 429 通常来自供应商侧限流或额度不足，优先提示用户检查账号和模型配额
+  if (/429|rate.?limit|quota|insufficient_quota|too many requests/i.test(haystack)) {
+    return `供应商返回 429：请求被限流或额度不足。请检查 API 余额/免费额度、模型权限、请求频率，或切换模型/供应商。原始错误：${message}${meta ? `（${meta}）` : ""}`;
+  }
+  if (/401|unauthorized|invalid.?api.?key/i.test(haystack)) {
+    return `供应商认证失败：请检查 API Key、Base URL 和模型所属供应商是否匹配。原始错误：${message}${meta ? `（${meta}）` : ""}`;
+  }
+  if (/403|forbidden|permission/i.test(haystack)) {
+    return `供应商拒绝访问：当前 API Key 可能没有该模型权限，或账号未开通对应服务。原始错误：${message}${meta ? `（${meta}）` : ""}`;
+  }
   if (/failed to fetch|networkerror|cors|load failed/i.test(message)) {
     return `${message}。当前 Web 预览是浏览器直连接口，可能被供应商 CORS 策略拦截；请使用桌面 Electron 模式，或确认供应商允许浏览器跨域调用。`;
   }
-  return message;
+  return meta ? `${message}（${meta}）` : message;
 }
 
 function loadConfig(): Config {
@@ -157,7 +189,9 @@ function useToast() {
   const show = useCallback((msg: string, type: ToastType = "info") => {
     const id = ++toastId;
     setToasts((t) => [...t, { id, msg, type }]);
-    setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 3500);
+    // 错误信息通常包含供应商返回原因，停留更久便于用户阅读和排查
+    const duration = type === "error" ? 8000 : 3500;
+    setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), duration);
   }, []);
   return { toasts, show };
 }

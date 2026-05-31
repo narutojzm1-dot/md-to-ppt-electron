@@ -95,6 +95,43 @@ function getErrorMessage(err: unknown): string {
   return String(err);
 }
 
+function getApiErrorField(err: unknown, field: string): unknown {
+  if (!err || typeof err !== "object") return undefined;
+  const record = err as Record<string, unknown>;
+  if (record[field] !== undefined) return record[field];
+  const nested = record.error;
+  if (nested && typeof nested === "object") {
+    return (nested as Record<string, unknown>)[field];
+  }
+  return undefined;
+}
+
+function formatProviderError(err: unknown): string {
+  const message = getErrorMessage(err);
+  const status = getApiErrorField(err, "status") ?? getApiErrorField(err, "statusCode");
+  const code = getApiErrorField(err, "code");
+  const type = getApiErrorField(err, "type");
+  const statusText = typeof status === "number" || typeof status === "string" ? String(status) : "";
+  const codeText = typeof code === "string" ? code : "";
+  const typeText = typeof type === "string" ? type : "";
+  const meta = [statusText && `HTTP ${statusText}`, codeText && `code=${codeText}`, typeText && `type=${typeText}`]
+    .filter(Boolean)
+    .join(", ");
+  const haystack = `${statusText} ${codeText} ${typeText} ${message}`;
+
+  // 429 通常代表限流或额度不足，直接给出可操作排查方向
+  if (/429|rate.?limit|quota|insufficient_quota|too many requests/i.test(haystack)) {
+    return `供应商返回 429：请求被限流或额度不足。请检查 API 余额/免费额度、模型是否有权限、请求频率是否过高，或切换到更低成本/更高额度的模型。原始错误：${message}${meta ? `（${meta}）` : ""}`;
+  }
+  if (/401|unauthorized|invalid.?api.?key/i.test(haystack)) {
+    return `供应商认证失败：请检查 API Key 是否正确、是否粘贴了多余空格，以及 Base URL 是否匹配该 Key。原始错误：${message}${meta ? `（${meta}）` : ""}`;
+  }
+  if (/403|forbidden|permission/i.test(haystack)) {
+    return `供应商拒绝访问：当前 API Key 可能没有该模型权限，或账号未开通对应服务。原始错误：${message}${meta ? `（${meta}）` : ""}`;
+  }
+  return meta ? `${message}（${meta}）` : message;
+}
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1280,
@@ -249,7 +286,7 @@ ipcMain.handle(
       }
       return { success: true, content };
     } catch (err: unknown) {
-      return { success: false, error: getErrorMessage(err) };
+      return { success: false, error: formatProviderError(err) };
     }
   }
 );

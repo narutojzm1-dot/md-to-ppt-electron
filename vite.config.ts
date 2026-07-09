@@ -5,6 +5,8 @@ import path from "path";
 
 // 纯 Web 构建配置（不依赖 vite-plugin-electron，方便打包和分发）
 export default defineConfig({
+  // Electron 生产环境通过 file:// 加载，必须使用相对资源路径，否则会白屏
+  base: "./",
   plugins: [react(), tailwindcss()],
   resolve: {
     alias: {

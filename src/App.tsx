@@ -1,23 +1,18 @@
-import { useState, useRef, useCallback, useEffect, useId } from "react";
+import { useState, useRef, useCallback, useEffect, lazy, Suspense } from "react";
 import OpenAI from "openai";
-import { electronAPI, isElectron, type ExportFormat } from "./lib/electronAPI";
-import os from "os";
+import { electronAPI, isElectron, type ExportFormat, type RuntimeCheckResult } from "./lib/electronAPI";
+import {
+  buildOutputMarpPath,
+  cleanupMarpContent,
+  DEFAULT_MAX_TOKENS,
+  formatConvertError,
+  getMarpFileName,
+  MARP_PROMPT,
+  normalizeMarpContent,
+} from "../shared/marp";
 
-// ─── Marp 转换 Prompt ────────────────────────────────────────────────────────
-const MARP_PROMPT = `你是一个专业的 PPT 演示文稿策划专家和 Markdown 工程师。
-将用户提供的 Markdown 文档转换为可以直接使用 Marp 渲染的高质量演示文稿源码。
-
-【Marp 基础语法】
-- 文件头部必须包含 YAML frontmatter（marp: true, theme: default, paginate: true）
-- 使用 --- 分隔每一页幻灯片
-
-【内容转换策略】
-1. 结构化重构：H1/H2 作为幻灯片标题；标题必须是洞察或结论；每页 3-5 个核心要点；总页数 10-15 页
-2. 精准可视化：流程/架构关系用 Mermaid 代码块；数据对比保留 Markdown 表格
-3. 代码展示：保留关键代码片段，过长时保留核心逻辑并用注释省略
-4. 视觉节奏：首页封面（大标题+副标题）；第二页目录；最后一页 Q&A
-
-【输出要求】只输出 Marp Markdown 源码，不要包含任何解释性文字，不要用代码块包裹。`;
+// 预览依赖 marp-core，体积较大，按需懒加载避免拖慢首屏
+const MarpPreview = lazy(() => import("./components/MarpPreview"));
 
 // ─── 本地存储 ────────────────────────────────────────────────────────────────
 const STORAGE_KEY = "md2ppt_electron_config";
@@ -116,12 +111,29 @@ type ToastType = "success" | "error" | "info";
 interface Toast { id: number; msg: string; type: ToastType; }
 let toastId = 0;
 
+type ConvertStage = "idle" | "preparing" | "requesting" | "receiving" | "validating" | "saving" | "success" | "error";
+interface ConvertProgress {
+  stage: ConvertStage;
+  message: string;
+  percent: number;
+  startedAt: number | null;
+  finishedAt?: number;
+  error?: string;
+  warnings: string[];
+}
+
+function initialConvertProgress(): ConvertProgress {
+  return { stage: "idle", message: "等待开始转换", percent: 0, startedAt: null, warnings: [] };
+}
+
 function useToast() {
   const [toasts, setToasts] = useState<Toast[]>([]);
   const show = useCallback((msg: string, type: ToastType = "info") => {
     const id = ++toastId;
     setToasts((t) => [...t, { id, msg, type }]);
-    setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 3500);
+    // 错误信息通常包含供应商返回原因，停留更久便于用户阅读和排查
+    const duration = type === "error" ? 8000 : 3500;
+    setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), duration);
   }, []);
   return { toasts, show };
 }
@@ -136,20 +148,61 @@ export default function App() {
   const [converting, setConverting] = useState(false);
   const [exporting, setExporting] = useState<ExportFormat | null>(null);
   const [isDragOver, setIsDragOver] = useState(false);
-  const [nodeInfo, setNodeInfo] = useState<{ available: boolean; version: string | null } | null>(null);
+  const [nodeInfo, setNodeInfo] = useState<RuntimeCheckResult | null>(null);
   const [exportResults, setExportResults] = useState<Record<string, { success: boolean; file?: string }>>({});
+  const [convertProgress, setConvertProgress] = useState<ConvertProgress>(initialConvertProgress);
+  const [progressTick, setProgressTick] = useState(Date.now());
+  // 导出目录授权完成前禁止写文件，避免启动竞态导致“未授权”误报
+  const [outputDirReady, setOutputDirReady] = useState(!isElectron || !loadConfig().outputDir);
+  // 输入 Markdown 被手动修改后，提示用户需要重新转换
+  const [inputDirty, setInputDirty] = useState(false);
+  // 右侧在源码编辑和幻灯片预览之间切换
+  const [rightPane, setRightPane] = useState<"source" | "preview">("source");
   const fileInputRef = useRef<HTMLInputElement>(null);
   const { toasts, show: toast } = useToast();
+
+  const updateConvertProgress = useCallback((patch: Partial<ConvertProgress>) => {
+    setConvertProgress((current) => ({ ...current, ...patch }));
+  }, []);
 
   // 持久化配置
   useEffect(() => { localStorage.setItem(STORAGE_KEY, JSON.stringify(config)); }, [config]);
 
-  // 检查 Node.js 环境
+  // 检查 Node.js / npx 环境，并重新登记本地保存的导出目录
   useEffect(() => {
-    if (isElectron) {
-      electronAPI.checkNode().then(setNodeInfo);
+    const api = electronAPI;
+    if (!isElectron || !api) {
+      setOutputDirReady(true);
+      return;
     }
-  }, []);
+
+    api.checkNode().then(setNodeInfo);
+
+    let cancelled = false;
+    const syncOutputDir = async () => {
+      if (!config.outputDir) {
+        if (!cancelled) setOutputDirReady(true);
+        return;
+      }
+      if (!cancelled) setOutputDirReady(false);
+      const ok = await api.authorizeOutputDir(config.outputDir);
+      if (cancelled) return;
+      setOutputDirReady(ok);
+      if (!ok) toast("已保存的导出目录不可用，请重新选择", "error");
+    };
+    syncOutputDir();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [config.outputDir, toast]);
+
+  // 转换中持续刷新耗时显示，让用户知道请求仍在进行
+  useEffect(() => {
+    if (!converting) return;
+    const timer = window.setInterval(() => setProgressTick(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [converting]);
 
   // 处理文件（来自 Electron 对话框或拖拽）
   const loadFile = useCallback((content: string, name: string) => {
@@ -158,18 +211,21 @@ export default function App() {
     setMarpContent("");
     setSavedMarpPath("");
     setExportResults({});
+    setInputDirty(false);
+    setRightPane("source");
+    setConvertProgress(initialConvertProgress());
     toast(`已加载：${name}`, "success");
   }, [toast]);
 
   // Electron 文件打开对话框
-  const handleOpenFile = async () => {
-    if (isElectron) {
+  const handleOpenFile = useCallback(async () => {
+    if (isElectron && electronAPI) {
       const result = await electronAPI.openFile();
       if (result) loadFile(result.content, result.fileName);
     } else {
       fileInputRef.current?.click();
     }
-  };
+  }, [loadFile]);
 
   // 浏览器文件输入
   const onFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -186,7 +242,7 @@ export default function App() {
     setIsDragOver(false);
     const file = e.dataTransfer.files?.[0];
     if (!file) return;
-    if (!file.name.endsWith(".md") && !file.name.endsWith(".markdown")) {
+    if (!/\.(md|markdown)$/i.test(file.name)) {
       toast("请拖入 .md 或 .markdown 文件", "error");
       return;
     }
@@ -197,10 +253,50 @@ export default function App() {
 
   // 选择输出目录
   const handleSelectOutputDir = async () => {
-    if (isElectron) {
+    if (isElectron && electronAPI) {
       const dir = await electronAPI.selectOutputDir();
       if (dir) setConfig((c) => ({ ...c, outputDir: dir }));
     }
+  };
+
+  // 手动编辑输入 Markdown 时，清空旧结果，避免导出过期内容
+  const handleMdChange = (value: string) => {
+    setMdContent(value);
+    if (marpContent || convertProgress.stage !== "idle") {
+      setMarpContent("");
+      setSavedMarpPath("");
+      setExportResults({});
+      setConvertProgress(initialConvertProgress());
+      setInputDirty(true);
+    }
+  };
+
+  // 手动编辑 Marp 源码后，重新做本地质量检查，允许用户修复后导出
+  const handleMarpChange = (value: string) => {
+    setMarpContent(value);
+    setSavedMarpPath("");
+    setExportResults({});
+    const normalized = normalizeMarpContent(value, config.theme);
+    if (normalized.errors.length > 0) {
+      setConvertProgress((current) => ({
+        ...current,
+        stage: "error",
+        message: "当前源码仍未通过质量检查，请继续修改或重新转换。",
+        warnings: normalized.warnings,
+        error: normalized.errors.join(" "),
+        finishedAt: Date.now(),
+      }));
+      return;
+    }
+    setConvertProgress((current) => ({
+      ...current,
+      stage: "success",
+      message: "已根据你的手动修改通过质量检查，可以导出。",
+      warnings: normalized.warnings,
+      error: undefined,
+      finishedAt: Date.now(),
+      percent: 100,
+    }));
   };
 
   // AI 转换
@@ -213,93 +309,197 @@ export default function App() {
     setMarpContent("");
     setSavedMarpPath("");
     setExportResults({});
+    setInputDirty(false);
+    setConvertProgress({
+      stage: "preparing",
+      message: "正在准备请求参数...",
+      percent: 8,
+      startedAt: Date.now(),
+      warnings: [],
+    });
 
     try {
-      const clientOpts: ConstructorParameters<typeof OpenAI>[0] = {
-        apiKey: config.apiKey,
-        dangerouslyAllowBrowser: true,
-      };
-      if (config.baseUrl.trim()) clientOpts.baseURL = config.baseUrl.trim().replace(/\/$/, "");
-
-      const client = new OpenAI(clientOpts);
-      const resp = await client.chat.completions.create({
-        model: config.model.trim(),
-        messages: [
-          { role: "system", content: MARP_PROMPT },
-          { role: "user", content: mdContent },
-        ],
-        temperature: 0.7,
-        max_tokens: 4096,
-      });
-
-      let result = resp.choices[0]?.message?.content?.trim() ?? "";
-      for (const p of ["```markdown\n", "```marp\n", "```\n"]) {
-        if (result.startsWith(p)) { result = result.slice(p.length); break; }
+      if (isElectron && config.outputDir && !outputDirReady) {
+        throw new Error("导出目录仍在授权中，请稍候再试，或重新选择导出目录");
       }
-      if (result.endsWith("```")) result = result.slice(0, -3).trimEnd();
+
+      let result = "";
+      updateConvertProgress({
+        stage: "requesting",
+        message: isElectron ? "正在通过 Electron 主进程请求 AI..." : "正在通过浏览器请求 AI...",
+        percent: 25,
+      });
+      if (isElectron && electronAPI) {
+        // 桌面端通过主进程请求 AI，避免浏览器 CORS 限制并减少 API Key 暴露面
+        const resp = await electronAPI.generateMarp({
+          apiKey: config.apiKey,
+          baseUrl: config.baseUrl.trim() || undefined,
+          model: config.model.trim(),
+          markdown: mdContent,
+        });
+        if (!resp.success) throw new Error(resp.error || "AI 转换失败");
+        result = resp.content ?? "";
+      } else {
+        // Web 预览只能浏览器直连接口，部分供应商会因为 CORS 拒绝请求
+        const clientOpts: ConstructorParameters<typeof OpenAI>[0] = {
+          apiKey: config.apiKey,
+          dangerouslyAllowBrowser: true,
+        };
+        if (config.baseUrl.trim()) clientOpts.baseURL = config.baseUrl.trim().replace(/\/$/, "");
+
+        const client = new OpenAI(clientOpts);
+        const resp = await client.chat.completions.create({
+          model: config.model.trim(),
+          messages: [
+            { role: "system", content: MARP_PROMPT },
+            { role: "user", content: mdContent },
+          ],
+          temperature: 0.7,
+          max_tokens: DEFAULT_MAX_TOKENS,
+        });
+        result = cleanupMarpContent(resp.choices[0]?.message?.content ?? "");
+      }
+
+      updateConvertProgress({
+        stage: "receiving",
+        message: "已收到模型返回，正在解析内容...",
+        percent: 68,
+      });
+      if (!result.trim()) {
+        throw new Error("模型返回内容为空，请调整提示词或模型后重试");
+      }
+
+      updateConvertProgress({
+        stage: "validating",
+        message: "正在校验 Marp 格式...",
+        percent: 82,
+      });
+      const normalized = normalizeMarpContent(result, config.theme);
+      result = normalized.content;
 
       setMarpContent(result);
-      toast("转换成功！", "success");
+      if (normalized.errors.length > 0) {
+        setConvertProgress((current) => ({
+          ...current,
+          stage: "error",
+          message: "模型返回了内容，但未通过 PPT 源码质量检查。",
+          percent: 100,
+          finishedAt: Date.now(),
+          warnings: normalized.warnings,
+          error: normalized.errors.join(" "),
+        }));
+        toast(`生成结果不可直接导出：${normalized.errors[0]}`, "error");
+        return;
+      }
+      if (normalized.warnings.length > 0) {
+        toast(`转换完成，但需要检查：${normalized.warnings[0]}`, "info");
+      } else {
+        toast("转换成功！", "success");
+      }
 
       // 在 Electron 中自动保存临时文件供导出使用
-      if (isElectron && config.outputDir) {
-        const tmpPath = `${config.outputDir}/${fileName.replace(/\.md$/, "_marp.md")}`;
+      if (isElectron && electronAPI && config.outputDir) {
+        updateConvertProgress({
+          stage: "saving",
+          message: "正在保存临时 Marp 文件，供导出使用...",
+          percent: 92,
+        });
+        const tmpPath = buildOutputMarpPath(config.outputDir, fileName);
         await electronAPI.writeFile(tmpPath, result);
         setSavedMarpPath(tmpPath);
       }
+      setConvertProgress((current) => ({
+        ...current,
+        stage: "success",
+        message: normalized.warnings.length > 0 ? "转换完成，但建议检查生成内容。" : "转换完成，可以保存或导出。",
+        percent: 100,
+        finishedAt: Date.now(),
+        warnings: normalized.warnings,
+        error: undefined,
+      }));
     } catch (err: unknown) {
-      toast(`转换失败：${err instanceof Error ? err.message : String(err)}`, "error");
+      const errorMessage = formatConvertError(err);
+      setConvertProgress((current) => ({
+        ...current,
+        stage: "error",
+        message: "转换失败，请根据错误详情排查。",
+        percent: Math.max(current.percent, 25),
+        finishedAt: Date.now(),
+        error: errorMessage,
+      }));
+      toast(`转换失败：${errorMessage}`, "error");
     } finally {
       setConverting(false);
     }
   };
 
   // 保存 Marp 源码
-  const handleSave = async () => {
+  const handleSave = useCallback(async () => {
     if (!marpContent) return;
-    if (isElectron) {
-      const defaultName = fileName.replace(/\.md$/, "_marp.md");
-      const saved = await electronAPI.saveFile({ content: marpContent, defaultName });
-      if (saved) {
-        setSavedMarpPath(saved);
-        toast(`已保存：${saved}`, "success");
+    try {
+      if (isElectron && electronAPI) {
+        const defaultName = getMarpFileName(fileName);
+        const saved = await electronAPI.saveFile({ content: marpContent, defaultName });
+        if (saved) {
+          setSavedMarpPath(saved);
+          toast(`已保存：${saved}`, "success");
+        }
+      } else {
+        const blob = new Blob([marpContent], { type: "text/markdown;charset=utf-8" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = getMarpFileName(fileName);
+        a.click();
+        URL.revokeObjectURL(url);
+        toast("文件已下载", "success");
       }
-    } else {
-      const blob = new Blob([marpContent], { type: "text/markdown;charset=utf-8" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = fileName.replace(/\.md$/, "_marp.md") || "presentation_marp.md";
-      a.click();
-      URL.revokeObjectURL(url);
-      toast("文件已下载", "success");
+    } catch (err: unknown) {
+      toast(`保存失败：${err instanceof Error ? err.message : String(err)}`, "error");
     }
-  };
+  }, [fileName, marpContent, toast]);
+
+  // 响应桌面菜单快捷键：打开文件 / 保存源码
+  useEffect(() => {
+    if (!isElectron || !electronAPI) return;
+    const offOpen = electronAPI.onMenuOpenFile(() => {
+      void handleOpenFile();
+    });
+    const offSave = electronAPI.onMenuSaveFile(() => {
+      void handleSave();
+    });
+    return () => {
+      offOpen();
+      offSave();
+    };
+  }, [handleOpenFile, handleSave]);
 
   // 复制到剪贴板
-  const handleCopy = () => {
-    navigator.clipboard.writeText(marpContent);
-    toast("已复制到剪贴板", "success");
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(marpContent);
+      toast("已复制到剪贴板", "success");
+    } catch {
+      toast("复制失败，请检查系统剪贴板权限", "error");
+    }
   };
 
   // Marp 导出（仅 Electron）
   const handleExport = async (format: ExportFormat) => {
-    if (!isElectron) { toast("导出功能仅在桌面版中可用", "info"); return; }
+    if (!isElectron || !electronAPI) { toast("导出功能仅在桌面版中可用", "info"); return; }
     if (!marpContent) { toast("请先完成转换", "error"); return; }
+    if (convertProgress.stage === "error") { toast("当前生成结果未通过质量检查，请继续修改或重新转换后再导出", "error"); return; }
     if (!config.outputDir) { toast("请先选择输出目录", "error"); return; }
-    if (!nodeInfo?.available) { toast("未检测到 Node.js，请先安装 Node.js", "error"); return; }
-
-    // 确保有保存的临时文件
-    let marpPath = savedMarpPath;
-    if (!marpPath) {
-      const tmpPath = `${config.outputDir}/${fileName.replace(/\.md$/, "_marp.md") || "presentation_marp.md"}`;
-      await electronAPI.writeFile(tmpPath, marpContent);
-      setSavedMarpPath(tmpPath);
-      marpPath = tmpPath;
-    }
+    if (!outputDirReady) { toast("导出目录仍在授权中，请稍候再试", "error"); return; }
+    if (!nodeInfo?.available) { toast("未检测到 Node.js 或本地 Marp CLI，请先安装依赖", "error"); return; }
 
     setExporting(format);
     try {
+      // 每次导出都先把当前编辑器内容写回磁盘，避免导出过期文件
+      const marpPath = savedMarpPath || buildOutputMarpPath(config.outputDir, fileName);
+      await electronAPI.writeFile(marpPath, marpContent);
+      setSavedMarpPath(marpPath);
+
       const result = await electronAPI.marpExport({
         marpFilePath: marpPath,
         outputDir: config.outputDir,
@@ -313,19 +513,34 @@ export default function App() {
       } else {
         toast(`导出失败：${result.error}`, "error");
       }
+    } catch (err: unknown) {
+      toast(`导出失败：${err instanceof Error ? err.message : String(err)}`, "error");
     } finally {
       setExporting(null);
     }
   };
 
-  const configOk = config.apiKey.trim() && config.model.trim();
+  const configOk = Boolean(config.apiKey.trim() && config.model.trim());
+  const canExport = Boolean(
+    marpContent &&
+    convertProgress.stage !== "error" &&
+    config.outputDir &&
+    outputDirReady &&
+    nodeInfo?.available &&
+    exporting === null
+  );
+  const progressElapsedSeconds = convertProgress.startedAt
+    ? Math.max(0, Math.round(((convertProgress.finishedAt ?? progressTick) - convertProgress.startedAt) / 1000))
+    : 0;
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100vh", overflow: "hidden" }}>
       <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
 
       {/* ── 顶部标题栏 ── */}
-      <header style={{
+      <header
+        className="electron-drag-region"
+        style={{
         height: 44,
         background: "var(--surface)",
         borderBottom: "1px solid var(--border)",
@@ -334,9 +549,9 @@ export default function App() {
         padding: "0 16px",
         gap: 10,
         flexShrink: 0,
-        WebkitAppRegion: "drag" as any,
-      }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 8, WebkitAppRegion: "no-drag" as any }}>
+      }}
+      >
+        <div className="electron-no-drag" style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <div style={{
             width: 26, height: 26, borderRadius: 6,
             background: "var(--primary)", display: "flex",
@@ -349,12 +564,14 @@ export default function App() {
         </div>
         <div style={{ flex: 1 }} />
         {isElectron && nodeInfo && (
-          <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: "var(--text-muted)", WebkitAppRegion: "no-drag" as any }}>
+          <div className="electron-no-drag" style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: "var(--text-muted)" }}>
             <div style={{
               width: 7, height: 7, borderRadius: "50%",
               background: nodeInfo.available ? "var(--success)" : "var(--error)",
             }} />
-            {nodeInfo.available ? `Node.js ${nodeInfo.version}` : "未检测到 Node.js"}
+            {nodeInfo.available
+              ? `Node.js ${nodeInfo.version}${nodeInfo.npxVersion ? ` / ${nodeInfo.npxVersion}` : ""}`
+              : "未检测到 Node.js 或 Marp CLI"}
           </div>
         )}
       </header>
@@ -505,6 +722,17 @@ export default function App() {
               {configOk ? <Icon.Check /> : <Icon.Alert />}
               {configOk ? "配置完成，可以开始转换" : "请填写 API Key 和模型 ID"}
             </div>
+
+            {!isElectron && (
+              <div style={{
+                display: "flex", alignItems: "flex-start", gap: 6,
+                padding: "8px 10px", borderRadius: 6, fontSize: 11.5,
+                background: "var(--warning-bg)", color: "var(--warning)",
+              }}>
+                <Icon.Alert />
+                <span>当前是 Web 预览，AI 请求会受浏览器 CORS 限制；桌面版会通过主进程请求，更适合完整测试。</span>
+              </div>
+            )}
           </div>
         </aside>
 
@@ -568,12 +796,22 @@ export default function App() {
                 </div>
               </div>
             ) : (
-              <textarea
-                className="code-editor"
-                value={mdContent}
-                onChange={(e) => setMdContent(e.target.value)}
-                spellCheck={false}
-              />
+              <>
+                {inputDirty && (
+                  <div style={{
+                    padding: "8px 10px", borderRadius: "var(--radius)", fontSize: 11.5,
+                    background: "var(--warning-bg)", color: "var(--warning)",
+                  }}>
+                    输入内容已修改，旧的 Marp 结果已清空，请重新转换后再导出。
+                  </div>
+                )}
+                <textarea
+                  className="code-editor"
+                  value={mdContent}
+                  onChange={(e) => handleMdChange(e.target.value)}
+                  spellCheck={false}
+                />
+              </>
             )}
 
             {/* 转换按钮 */}
@@ -585,6 +823,50 @@ export default function App() {
             >
               {converting ? <><Icon.Spin />正在转换，请稍候...</> : <><Icon.Wand />一键转换为 Marp PPT</>}
             </button>
+
+            {convertProgress.stage !== "idle" && (
+              <div style={{
+                background: "var(--surface)", border: "1px solid var(--border)",
+                borderRadius: "var(--radius)", padding: "10px 12px",
+                display: "flex", flexDirection: "column", gap: 8,
+              }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  {converting ? <Icon.Spin /> : convertProgress.stage === "error" ? <Icon.Alert /> : <Icon.Check />}
+                  <span style={{ fontWeight: 600, fontSize: 12 }}>转换进度</span>
+                  <span style={{ marginLeft: "auto", fontSize: 11, color: "var(--text-muted)" }}>
+                    {progressElapsedSeconds}s
+                  </span>
+                </div>
+                <div style={{
+                  height: 6, borderRadius: 999, background: "var(--bg)",
+                  overflow: "hidden", border: "1px solid var(--border)",
+                }}>
+                  <div style={{
+                    width: `${convertProgress.percent}%`,
+                    height: "100%",
+                    background: convertProgress.stage === "error" ? "var(--error)" : "var(--primary)",
+                    transition: "width 0.2s ease",
+                  }} />
+                </div>
+                <div style={{ fontSize: 11.5, color: "var(--text-muted)", lineHeight: 1.5 }}>
+                  {convertProgress.message}
+                </div>
+                {convertProgress.warnings.map((warning) => (
+                  <div key={warning} style={{ fontSize: 11.5, color: "var(--warning)", lineHeight: 1.5 }}>
+                    <Icon.Alert /> {warning}
+                  </div>
+                ))}
+                {convertProgress.error && (
+                  <div style={{
+                    fontSize: 11.5, color: "var(--error)", lineHeight: 1.5,
+                    background: "var(--error-bg)", borderRadius: 6, padding: "6px 8px",
+                    userSelect: "text",
+                  }}>
+                    {convertProgress.error}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         </div>
 
@@ -598,11 +880,39 @@ export default function App() {
             display: "flex", alignItems: "center", gap: 8, flexShrink: 0,
           }}>
             <Icon.Code />
-            <span style={{ fontWeight: 600, fontSize: 13 }}>Marp 源码输出</span>
-            {marpContent && <span className="badge badge-green">已生成</span>}
+            <span style={{ fontWeight: 600, fontSize: 13 }}>Marp 输出</span>
+            {marpContent && (
+              <span className={convertProgress.stage === "error" ? "badge badge-orange" : "badge badge-green"}>
+                {convertProgress.stage === "error" ? "需重试" : "已生成"}
+              </span>
+            )}
             <div style={{ flex: 1 }} />
             {marpContent && (
               <>
+                <button
+                  className="btn btn-outline"
+                  style={{
+                    height: 28, fontSize: 12,
+                    background: rightPane === "source" ? "var(--accent)" : undefined,
+                    borderColor: rightPane === "source" ? "var(--primary)" : undefined,
+                    color: rightPane === "source" ? "var(--primary)" : undefined,
+                  }}
+                  onClick={() => setRightPane("source")}
+                >
+                  源码
+                </button>
+                <button
+                  className="btn btn-outline"
+                  style={{
+                    height: 28, fontSize: 12,
+                    background: rightPane === "preview" ? "var(--accent)" : undefined,
+                    borderColor: rightPane === "preview" ? "var(--primary)" : undefined,
+                    color: rightPane === "preview" ? "var(--primary)" : undefined,
+                  }}
+                  onClick={() => setRightPane("preview")}
+                >
+                  <Icon.Eye />预览
+                </button>
                 <button className="btn btn-outline" style={{ height: 28, fontSize: 12 }} onClick={handleCopy}>
                   <Icon.Copy />复制
                 </button>
@@ -614,6 +924,24 @@ export default function App() {
           </div>
 
           <div style={{ flex: 1, padding: 10, overflow: "hidden", display: "flex", flexDirection: "column", gap: 8 }}>
+            {marpContent && (
+              <div style={{
+                background: convertProgress.stage === "error" ? "var(--error-bg)" : "var(--success-bg)",
+                border: `1px solid ${convertProgress.stage === "error" ? "rgba(220,38,38,0.25)" : "rgba(5,150,105,0.25)"}`,
+                borderRadius: "var(--radius)", padding: "8px 10px",
+                fontSize: 11.5, lineHeight: 1.55,
+                color: convertProgress.stage === "error" ? "var(--error)" : "var(--success)",
+              }}>
+                <strong>这不是最终 PPT 文件。</strong>
+                这里显示的是 Marp Markdown 源码：它应该包含 frontmatter、多个 `---` 分页、每页标题和正文。
+                {convertProgress.stage === "error"
+                  ? " 当前结果没有通过质量检查，建议重新转换或换模型。"
+                  : isElectron
+                    ? " 检查无误后可点击下方 PDF/PPTX/HTML 导出。"
+                    : " Web 预览只能复制命令手动渲染，桌面版可一键导出。"}
+              </div>
+            )}
+
             {!marpContent ? (
               <div style={{
                 flex: 1, border: "1px dashed var(--border)", borderRadius: "var(--radius)",
@@ -625,11 +953,25 @@ export default function App() {
                   <p style={{ fontSize: 11.5, color: "var(--text-muted)", marginTop: 4 }}>配置 API 并加载 Markdown 后点击转换</p>
                 </div>
               </div>
+            ) : rightPane === "preview" ? (
+              <Suspense
+                fallback={
+                  <div style={{
+                    flex: 1, border: "1px dashed var(--border)", borderRadius: "var(--radius)",
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                    color: "var(--text-muted)", fontSize: 12,
+                  }}>
+                    正在加载预览引擎...
+                  </div>
+                }
+              >
+                <MarpPreview content={marpContent} />
+              </Suspense>
             ) : (
               <textarea
                 className="code-editor"
                 value={marpContent}
-                onChange={(e) => setMarpContent(e.target.value)}
+                onChange={(e) => handleMarpChange(e.target.value)}
                 spellCheck={false}
               />
             )}
@@ -650,6 +992,11 @@ export default function App() {
                       ⚠ 请先在左侧选择导出目录
                     </span>
                   )}
+                  {isElectron && config.outputDir && !outputDirReady && (
+                    <span style={{ fontSize: 11, color: "var(--warning)", marginLeft: 4 }}>
+                      ⚠ 导出目录授权中...
+                    </span>
+                  )}
                 </div>
 
                 {isElectron ? (
@@ -668,7 +1015,7 @@ export default function App() {
                               color: result?.success ? "var(--success)" : undefined,
                             }}
                             onClick={() => handleExport(fmt)}
-                            disabled={exporting !== null || !config.outputDir}
+                            disabled={!canExport}
                           >
                             {exporting === fmt ? <Icon.Spin /> : result?.success ? <Icon.Check /> : <Icon.Download />}
                             {fmt.toUpperCase()}
@@ -680,7 +1027,7 @@ export default function App() {
                                 color: "var(--primary)", background: "none", border: "none",
                                 cursor: "pointer", textDecoration: "underline",
                               }}
-                              onClick={() => electronAPI.showItemInFolder(result.file!)}
+                              onClick={() => electronAPI?.showItemInFolder(result.file!)}
                             >
                               在文件夹中显示
                             </button>
@@ -690,12 +1037,12 @@ export default function App() {
                     })}
                   </div>
                 ) : (
-                  // Web：显示命令行提示
+                  // Web：显示命令行提示，文件名使用当前生成结果
                   <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
                     {[
-                      { label: "PDF", cmd: "npx @marp-team/marp-cli@latest 输出.md --pdf" },
-                      { label: "PPTX", cmd: "npx @marp-team/marp-cli@latest 输出.md --pptx" },
-                      { label: "HTML", cmd: "npx @marp-team/marp-cli@latest 输出.md --html" },
+                      { label: "PDF", cmd: `npx @marp-team/marp-cli@latest ${getMarpFileName(fileName)} --pdf` },
+                      { label: "PPTX", cmd: `npx @marp-team/marp-cli@latest ${getMarpFileName(fileName)} --pptx` },
+                      { label: "HTML", cmd: `npx @marp-team/marp-cli@latest ${getMarpFileName(fileName)} --html` },
                     ].map((item) => (
                       <div key={item.label} style={{ display: "flex", alignItems: "center", gap: 8 }}>
                         <span style={{ fontSize: 11, color: "var(--text-muted)", width: 36, flexShrink: 0 }}>{item.label}</span>

@@ -35,6 +35,18 @@ contextBridge.exposeInMainWorld("electronAPI", {
   // Shell
   showItemInFolder: (filePath: string) =>
     ipcRenderer.invoke("shell:showItemInFolder", filePath),
+
+  // 应用菜单事件
+  onMenuOpenFile: (callback: () => void) => {
+    const listener = () => callback();
+    ipcRenderer.on("menu:openFile", listener);
+    return () => ipcRenderer.removeListener("menu:openFile", listener);
+  },
+  onMenuSaveFile: (callback: () => void) => {
+    const listener = () => callback();
+    ipcRenderer.on("menu:saveFile", listener);
+    return () => ipcRenderer.removeListener("menu:saveFile", listener);
+  },
 });
 
 // TypeScript 类型声明（供渲染进程使用）
@@ -64,4 +76,6 @@ export type ElectronAPI = {
   readFile: (filePath: string) => Promise<string>;
   writeFile: (filePath: string, content: string) => Promise<boolean>;
   showItemInFolder: (filePath: string) => Promise<void>;
+  onMenuOpenFile: (callback: () => void) => () => void;
+  onMenuSaveFile: (callback: () => void) => () => void;
 };

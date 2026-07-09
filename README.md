@@ -83,16 +83,20 @@ pnpm electron:build
 
 ## 注意事项
 
-- 导出功能需要本地安装 Node.js（应用启动时会自动检测 Node 和 npx）
-- 首次导出时，npx 会自动下载 Marp CLI，需要网络连接；超时时间为 5 分钟
+- 导出优先使用项目内安装的 `@marp-team/marp-cli`，不再强依赖每次 `npx` 联网下载
+- 应用启动时会检测 Node.js 与本地 Marp CLI 是否可用
+- 首次导出仍可能较慢（Chromium/依赖冷启动），超时时间为 5 分钟
 - API Key 仅保存在本地 localStorage，不会上传到任何服务器
 - 如果打包后出现白屏，请确认使用了最新构建（Vite `base: './'`）
-- 如果桌面应用检测不到 Node，请确认系统 PATH 中包含 `node` / `npx`（GUI 应用有时拿不到终端里的 PATH）
+- 桌面端支持菜单快捷键：`Ctrl/Cmd+O` 打开文件，`Ctrl/Cmd+S` 保存 Marp 源码
+- 右侧可在“源码 / 预览”之间切换，预览由 `@marp-team/marp-core` 本地渲染
 
 ## 项目结构
 
 ```
 .
+├── build/
+│   └── icon.png         # 应用图标
 ├── electron/
 │   ├── main.ts          # Electron 主进程（文件系统、Marp CLI、IPC）
 │   └── preload.ts       # 预加载脚本（安全暴露 API）
@@ -100,6 +104,8 @@ pnpm electron:build
 │   └── marp.ts          # 共享 Prompt、校验与错误格式化
 ├── src/
 │   ├── App.tsx          # 主界面（三栏布局）
+│   ├── components/
+│   │   └── MarpPreview.tsx  # 幻灯片预览
 │   ├── lib/
 │   │   └── electronAPI.ts  # Electron API 封装
 │   ├── main.tsx         # React 入口

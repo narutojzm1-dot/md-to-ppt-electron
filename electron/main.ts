@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, dialog, shell } from "electron";
+import { app, BrowserWindow, ipcMain, dialog, shell, Menu } from "electron";
 import { spawn, exec } from "child_process";
 import path from "path";
 import fs from "fs";
@@ -20,10 +20,19 @@ const EXPORT_FORMATS = new Set<ExportFormat>(["pdf", "pptx", "html"]);
 const MARP_THEMES = new Set(["default", "gaia", "uncover"]);
 const allowedOutputDirs = new Set<string>();
 const allowedFiles = new Set<string>();
-// 首次 npx 下载 Marp CLI 可能较慢，给足超时避免界面永久转圈
+// 本地 Marp CLI 首次冷启动也可能较慢，给足超时避免界面永久转圈
 const MARP_EXPORT_TIMEOUT_MS = 5 * 60 * 1000;
 
 let mainWindow: BrowserWindow | null = null;
+
+// 优先使用项目内安装的 marp-cli，避免每次导出都走 npx 联网下载
+function resolveLocalMarpCli(): string | null {
+  try {
+    return require.resolve("@marp-team/marp-cli/marp-cli.js");
+  } catch {
+    return null;
+  }
+}
 
 // 统一规范化路径，后续权限判断都基于绝对路径进行
 function normalizeFilePath(filePath: string): string {
@@ -107,7 +116,63 @@ function createWindow() {
   });
 }
 
-app.whenReady().then(createWindow);
+function createAppMenu() {
+  // 提供基础菜单，方便桌面端用快捷键打开/保存文件
+  const template: Electron.MenuItemConstructorOptions[] = [
+    {
+      label: "文件",
+      submenu: [
+        {
+          label: "打开 Markdown...",
+          accelerator: "CmdOrCtrl+O",
+          click: () => {
+            mainWindow?.webContents.send("menu:openFile");
+          },
+        },
+        {
+          label: "保存 Marp 源码...",
+          accelerator: "CmdOrCtrl+S",
+          click: () => {
+            mainWindow?.webContents.send("menu:saveFile");
+          },
+        },
+        { type: "separator" },
+        process.platform === "darwin" ? { role: "close" } : { role: "quit" },
+      ],
+    },
+    {
+      label: "编辑",
+      submenu: [
+        { role: "undo" },
+        { role: "redo" },
+        { type: "separator" },
+        { role: "cut" },
+        { role: "copy" },
+        { role: "paste" },
+        { role: "selectAll" },
+      ],
+    },
+    {
+      label: "视图",
+      submenu: [
+        { role: "reload" },
+        { role: "toggleDevTools" },
+        { type: "separator" },
+        { role: "resetZoom" },
+        { role: "zoomIn" },
+        { role: "zoomOut" },
+        { type: "separator" },
+        { role: "togglefullscreen" },
+      ],
+    },
+  ];
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+}
+
+app.whenReady().then(() => {
+  createAppMenu();
+  createWindow();
+});
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
@@ -168,17 +233,30 @@ ipcMain.handle("fs:authorizeOutputDir", (_event, outputDir: string) => {
   return true;
 });
 
-// ─── IPC: 检查 Node.js / npx 是否可用 ──────────────────────────────────────
+// ─── IPC: 检查 Node.js / 本地 Marp CLI 是否可用 ────────────────────────────
 ipcMain.handle("system:checkNode", async () => {
   try {
-    const [{ stdout: nodeStdout }, { stdout: npxStdout }] = await Promise.all([
-      execAsync("node --version"),
-      execAsync("npx --version"),
-    ]);
+    const { stdout: nodeStdout } = await execAsync("node --version");
+    const localMarpCli = resolveLocalMarpCli();
+    let npxVersion: string | null = null;
+    try {
+      const { stdout: npxStdout } = await execAsync("npx --version");
+      npxVersion = npxStdout.trim();
+    } catch {
+      // 本地 marp-cli 可用时，npx 不是硬依赖
+    }
+    if (!localMarpCli && !npxVersion) {
+      return {
+        available: false,
+        version: nodeStdout.trim(),
+        npxVersion: null,
+        error: "未找到本地 @marp-team/marp-cli，也未检测到 npx",
+      };
+    }
     return {
       available: true,
       version: nodeStdout.trim(),
-      npxVersion: npxStdout.trim(),
+      npxVersion: localMarpCli ? `local-marp-cli` : npxVersion,
     };
   } catch (err: unknown) {
     return {
@@ -266,14 +344,12 @@ ipcMain.handle(
     const baseName = path.basename(marpFilePath, path.extname(marpFilePath));
     const outputFile = path.join(outputDir, `${baseName}.${format}`);
 
-    const args = [
-      "@marp-team/marp-cli@latest",
-      tmpFile,
-      `--${format}`,
-      "--output",
-      outputFile,
-      "--allow-local-files",
-    ];
+    const localMarpCli = resolveLocalMarpCli();
+    // 优先：node + 本地 marp-cli；回退：npx 远程包（兼容旧环境）
+    const command = localMarpCli ? "node" : (process.platform === "win32" ? "npx.cmd" : "npx");
+    const args = localMarpCli
+      ? [localMarpCli, tmpFile, `--${format}`, "--output", outputFile, "--allow-local-files"]
+      : ["@marp-team/marp-cli@latest", tmpFile, `--${format}`, "--output", outputFile, "--allow-local-files"];
 
     if (theme) {
       args.push("--theme", theme);
@@ -281,9 +357,8 @@ ipcMain.handle(
 
     return new Promise<{ success: boolean; outputFile?: string; error?: string }>(
       (resolve) => {
-        const npxCommand = process.platform === "win32" ? "npx.cmd" : "npx";
         // 使用参数化 spawn，避免路径或文件名中的特殊字符被 shell 解释
-        const proc = spawn(npxCommand, args, { shell: false });
+        const proc = spawn(command, args, { shell: false });
         let stdout = "";
         let stderr = "";
         let settled = false;
@@ -296,12 +371,12 @@ ipcMain.handle(
           resolve(result);
         };
 
-        // 超时后主动结束进程，避免首次下载或卡死时界面永久等待
+        // 超时后主动结束进程，避免首次冷启动或卡死时界面永久等待
         const timeout = setTimeout(() => {
           proc.kill();
           finish({
             success: false,
-            error: `导出超时（${Math.round(MARP_EXPORT_TIMEOUT_MS / 1000)} 秒）。请检查网络，或手动执行一次 npx @marp-team/marp-cli@latest --version 预热缓存。`,
+            error: `导出超时（${Math.round(MARP_EXPORT_TIMEOUT_MS / 1000)} 秒）。请检查 Node.js 环境，或确认本地 @marp-team/marp-cli 已正确安装。`,
           });
         }, MARP_EXPORT_TIMEOUT_MS);
 

@@ -22,11 +22,17 @@
     "appId": "com.md2ppt.app",
     "productName": "MD to PPT",
     "directories": {
-      "output": "release"
+      "output": "release",
+      "buildResources": "build"
     },
+    "icon": "build/icon.png",
     "files": [
       "dist/**/*",
-      "dist-electron/**/*"
+      "dist-electron/**/*",
+      "package.json"
+    ],
+    "asarUnpack": [
+      "**/node_modules/@marp-team/marp-cli/**/*"
     ],
     "win": {
       "target": "nsis"
@@ -35,7 +41,8 @@
       "target": "dmg"
     },
     "linux": {
-      "target": "AppImage"
+      "target": "AppImage",
+      "category": "Office"
     },
     "extraMetadata": {
       "main": "dist-electron/electron/main.js"
@@ -57,6 +64,8 @@
     "vite": "^8.0.3"
   },
   "dependencies": {
+    "@marp-team/marp-cli": "^4.4.1",
+    "@marp-team/marp-core": "^4.3.1",
     "openai": "^6.33.0",
     "react": "^19.2.4",
     "react-dom": "^19.2.4"

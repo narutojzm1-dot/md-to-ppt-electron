@@ -47,6 +47,8 @@ export interface ElectronAPI {
   readFile: (filePath: string) => Promise<string>;
   writeFile: (filePath: string, content: string) => Promise<boolean>;
   showItemInFolder: (filePath: string) => Promise<void>;
+  onMenuOpenFile: (callback: () => void) => () => void;
+  onMenuSaveFile: (callback: () => void) => () => void;
 }
 
 // 检测是否在 Electron 环境中运行

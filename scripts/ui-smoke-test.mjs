@@ -19,7 +19,7 @@ await page.goto(appUrl, { waitUntil: "networkidle" });
 await assertText("MD to PPT");
 await assertText("供应商配置");
 await assertText("Markdown 输入");
-await assertText("Marp 源码输出");
+await assertText("Marp 输出");
 
 await page.locator('input[type="file"]').setInputFiles({
   name: "qa-smoke.md",

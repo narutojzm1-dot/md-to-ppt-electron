@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useEffect } from "react";
+import { useState, useRef, useCallback, useEffect, lazy, Suspense } from "react";
 import OpenAI from "openai";
 import { electronAPI, isElectron, type ExportFormat, type RuntimeCheckResult } from "./lib/electronAPI";
 import {
@@ -10,6 +10,9 @@ import {
   MARP_PROMPT,
   normalizeMarpContent,
 } from "../shared/marp";
+
+// 预览依赖 marp-core，体积较大，按需懒加载避免拖慢首屏
+const MarpPreview = lazy(() => import("./components/MarpPreview"));
 
 // ─── 本地存储 ────────────────────────────────────────────────────────────────
 const STORAGE_KEY = "md2ppt_electron_config";
@@ -153,6 +156,8 @@ export default function App() {
   const [outputDirReady, setOutputDirReady] = useState(!isElectron || !loadConfig().outputDir);
   // 输入 Markdown 被手动修改后，提示用户需要重新转换
   const [inputDirty, setInputDirty] = useState(false);
+  // 右侧在源码编辑和幻灯片预览之间切换
+  const [rightPane, setRightPane] = useState<"source" | "preview">("source");
   const fileInputRef = useRef<HTMLInputElement>(null);
   const { toasts, show: toast } = useToast();
 
@@ -207,9 +212,52 @@ export default function App() {
     setSavedMarpPath("");
     setExportResults({});
     setInputDirty(false);
+    setRightPane("source");
     setConvertProgress(initialConvertProgress());
     toast(`已加载：${name}`, "success");
   }, [toast]);
+
+  // Electron 文件打开对话框
+  const handleOpenFile = useCallback(async () => {
+    if (isElectron && electronAPI) {
+      const result = await electronAPI.openFile();
+      if (result) loadFile(result.content, result.fileName);
+    } else {
+      fileInputRef.current?.click();
+    }
+  }, [loadFile]);
+
+  // 浏览器文件输入
+  const onFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => loadFile(ev.target?.result as string, file.name);
+    reader.readAsText(file, "utf-8");
+  };
+
+  // 拖拽处理
+  const onDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragOver(false);
+    const file = e.dataTransfer.files?.[0];
+    if (!file) return;
+    if (!/\.(md|markdown)$/i.test(file.name)) {
+      toast("请拖入 .md 或 .markdown 文件", "error");
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = (ev) => loadFile(ev.target?.result as string, file.name);
+    reader.readAsText(file, "utf-8");
+  };
+
+  // 选择输出目录
+  const handleSelectOutputDir = async () => {
+    if (isElectron && electronAPI) {
+      const dir = await electronAPI.selectOutputDir();
+      if (dir) setConfig((c) => ({ ...c, outputDir: dir }));
+    }
+  };
 
   // 手动编辑输入 Markdown 时，清空旧结果，避免导出过期内容
   const handleMdChange = (value: string) => {
@@ -249,48 +297,6 @@ export default function App() {
       finishedAt: Date.now(),
       percent: 100,
     }));
-  };
-
-  // Electron 文件打开对话框
-  const handleOpenFile = async () => {
-    if (isElectron && electronAPI) {
-      const result = await electronAPI.openFile();
-      if (result) loadFile(result.content, result.fileName);
-    } else {
-      fileInputRef.current?.click();
-    }
-  };
-
-  // 浏览器文件输入
-  const onFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = (ev) => loadFile(ev.target?.result as string, file.name);
-    reader.readAsText(file, "utf-8");
-  };
-
-  // 拖拽处理
-  const onDrop = (e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragOver(false);
-    const file = e.dataTransfer.files?.[0];
-    if (!file) return;
-    if (!/\.(md|markdown)$/i.test(file.name)) {
-      toast("请拖入 .md 或 .markdown 文件", "error");
-      return;
-    }
-    const reader = new FileReader();
-    reader.onload = (ev) => loadFile(ev.target?.result as string, file.name);
-    reader.readAsText(file, "utf-8");
-  };
-
-  // 选择输出目录
-  const handleSelectOutputDir = async () => {
-    if (isElectron && electronAPI) {
-      const dir = await electronAPI.selectOutputDir();
-      if (dir) setConfig((c) => ({ ...c, outputDir: dir }));
-    }
   };
 
   // AI 转换
@@ -428,7 +434,7 @@ export default function App() {
   };
 
   // 保存 Marp 源码
-  const handleSave = async () => {
+  const handleSave = useCallback(async () => {
     if (!marpContent) return;
     try {
       if (isElectron && electronAPI) {
@@ -451,7 +457,22 @@ export default function App() {
     } catch (err: unknown) {
       toast(`保存失败：${err instanceof Error ? err.message : String(err)}`, "error");
     }
-  };
+  }, [fileName, marpContent, toast]);
+
+  // 响应桌面菜单快捷键：打开文件 / 保存源码
+  useEffect(() => {
+    if (!isElectron || !electronAPI) return;
+    const offOpen = electronAPI.onMenuOpenFile(() => {
+      void handleOpenFile();
+    });
+    const offSave = electronAPI.onMenuSaveFile(() => {
+      void handleSave();
+    });
+    return () => {
+      offOpen();
+      offSave();
+    };
+  }, [handleOpenFile, handleSave]);
 
   // 复制到剪贴板
   const handleCopy = async () => {
@@ -470,7 +491,7 @@ export default function App() {
     if (convertProgress.stage === "error") { toast("当前生成结果未通过质量检查，请继续修改或重新转换后再导出", "error"); return; }
     if (!config.outputDir) { toast("请先选择输出目录", "error"); return; }
     if (!outputDirReady) { toast("导出目录仍在授权中，请稍候再试", "error"); return; }
-    if (!nodeInfo?.available) { toast("未检测到 Node.js 或 npx，请先安装 Node.js", "error"); return; }
+    if (!nodeInfo?.available) { toast("未检测到 Node.js 或本地 Marp CLI，请先安装依赖", "error"); return; }
 
     setExporting(format);
     try {
@@ -548,7 +569,9 @@ export default function App() {
               width: 7, height: 7, borderRadius: "50%",
               background: nodeInfo.available ? "var(--success)" : "var(--error)",
             }} />
-            {nodeInfo.available ? `Node.js ${nodeInfo.version} / npx ${nodeInfo.npxVersion}` : "未检测到 Node.js 或 npx"}
+            {nodeInfo.available
+              ? `Node.js ${nodeInfo.version}${nodeInfo.npxVersion ? ` / ${nodeInfo.npxVersion}` : ""}`
+              : "未检测到 Node.js 或 Marp CLI"}
           </div>
         )}
       </header>
@@ -857,7 +880,7 @@ export default function App() {
             display: "flex", alignItems: "center", gap: 8, flexShrink: 0,
           }}>
             <Icon.Code />
-            <span style={{ fontWeight: 600, fontSize: 13 }}>Marp 源码输出</span>
+            <span style={{ fontWeight: 600, fontSize: 13 }}>Marp 输出</span>
             {marpContent && (
               <span className={convertProgress.stage === "error" ? "badge badge-orange" : "badge badge-green"}>
                 {convertProgress.stage === "error" ? "需重试" : "已生成"}
@@ -866,6 +889,30 @@ export default function App() {
             <div style={{ flex: 1 }} />
             {marpContent && (
               <>
+                <button
+                  className="btn btn-outline"
+                  style={{
+                    height: 28, fontSize: 12,
+                    background: rightPane === "source" ? "var(--accent)" : undefined,
+                    borderColor: rightPane === "source" ? "var(--primary)" : undefined,
+                    color: rightPane === "source" ? "var(--primary)" : undefined,
+                  }}
+                  onClick={() => setRightPane("source")}
+                >
+                  源码
+                </button>
+                <button
+                  className="btn btn-outline"
+                  style={{
+                    height: 28, fontSize: 12,
+                    background: rightPane === "preview" ? "var(--accent)" : undefined,
+                    borderColor: rightPane === "preview" ? "var(--primary)" : undefined,
+                    color: rightPane === "preview" ? "var(--primary)" : undefined,
+                  }}
+                  onClick={() => setRightPane("preview")}
+                >
+                  <Icon.Eye />预览
+                </button>
                 <button className="btn btn-outline" style={{ height: 28, fontSize: 12 }} onClick={handleCopy}>
                   <Icon.Copy />复制
                 </button>
@@ -906,6 +953,20 @@ export default function App() {
                   <p style={{ fontSize: 11.5, color: "var(--text-muted)", marginTop: 4 }}>配置 API 并加载 Markdown 后点击转换</p>
                 </div>
               </div>
+            ) : rightPane === "preview" ? (
+              <Suspense
+                fallback={
+                  <div style={{
+                    flex: 1, border: "1px dashed var(--border)", borderRadius: "var(--radius)",
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                    color: "var(--text-muted)", fontSize: 12,
+                  }}>
+                    正在加载预览引擎...
+                  </div>
+                }
+              >
+                <MarpPreview content={marpContent} />
+              </Suspense>
             ) : (
               <textarea
                 className="code-editor"

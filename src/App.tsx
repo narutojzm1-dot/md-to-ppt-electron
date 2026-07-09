@@ -1,27 +1,15 @@
-import { useState, useRef, useCallback, useEffect, useId } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import OpenAI from "openai";
 import { electronAPI, isElectron, type ExportFormat, type RuntimeCheckResult } from "./lib/electronAPI";
-import os from "os";
-
-// ─── Marp 转换 Prompt ────────────────────────────────────────────────────────
-const MARP_PROMPT = `你是一个专业的 PPT 演示文稿策划专家和 Markdown 工程师。
-将用户提供的 Markdown 文档转换为可以直接使用 Marp 渲染的高质量演示文稿源码。
-
-【Marp 基础语法】
-- 文件头部必须包含 YAML frontmatter（marp: true, theme: default, paginate: true）
-- 使用 --- 分隔每一页幻灯片
-- Mermaid 必须写成 \`\`\`mermaid 代码块，不能直接输出裸 graph/flowchart 文本
-
-【内容转换策略】
-1. 结构化重构：H1/H2 作为幻灯片标题；标题必须是洞察或结论；每页 3-5 个核心要点；总页数 10-15 页
-2. 精准可视化：流程/架构关系用 Mermaid 代码块；数据对比保留 Markdown 表格
-3. 代码展示：保留关键代码片段，过长时保留核心逻辑并用注释省略
-4. 视觉节奏：首页封面（大标题+副标题）；第二页目录；最后一页 Q&A
-
-【输出要求】
-- 只输出 Marp Markdown 源码，不要包含任何解释性文字，不要用代码块包裹整个文档
-- 必须生成完整幻灯片，而不是摘要、提纲或单个 Mermaid 图
-- 每页必须有标题，至少 8 页，使用 --- 分页。`;
+import {
+  buildOutputMarpPath,
+  cleanupMarpContent,
+  DEFAULT_MAX_TOKENS,
+  formatConvertError,
+  getMarpFileName,
+  MARP_PROMPT,
+  normalizeMarpContent,
+} from "../shared/marp";
 
 // ─── 本地存储 ────────────────────────────────────────────────────────────────
 const STORAGE_KEY = "md2ppt_electron_config";
@@ -32,99 +20,6 @@ interface Config {
   model: string;
   outputDir: string;
   theme: string;
-}
-
-// 统一生成 Marp 源文件名，兼容 .md / .markdown / 无扩展名场景
-function getMarpFileName(sourceFileName: string): string {
-  const safeName = sourceFileName.trim() || "presentation.md";
-  if (/\.(md|markdown)$/i.test(safeName)) {
-    return safeName.replace(/\.(md|markdown)$/i, "_marp.md");
-  }
-  return `${safeName}_marp.md`;
-}
-
-// 统一拼接输出目录下的临时 Marp 文件路径，避免目录尾部斜杠导致双斜杠
-function buildOutputMarpPath(outputDir: string, sourceFileName: string): string {
-  const normalizedDir = outputDir.replace(/[\\/]+$/, "");
-  return `${normalizedDir}/${getMarpFileName(sourceFileName)}`;
-}
-
-function cleanupMarpContent(content: string): string {
-  let result = content.trim();
-  // 兼容模型把结果夹在解释文本中的情况，优先提取第一个 Markdown/Marp 代码块
-  const fenced = result.match(/```(?:markdown|md|marp)?\s*([\s\S]*?)```/i);
-  if (fenced?.[1]) result = fenced[1].trim();
-  // 兼容不同模型返回的代码块包裹格式，统一提取纯 Marp 文本
-  result = result.replace(/^```(?:markdown|md|marp)?\s*/i, "");
-  if (result.endsWith("```")) result = result.slice(0, -3).trimEnd();
-  return result;
-}
-
-function normalizeMarpContent(content: string, theme: string): { content: string; warnings: string[]; errors: string[] } {
-  let result = cleanupMarpContent(content);
-  const warnings: string[] = [];
-  const errors: string[] = [];
-  if (!/^---\s*\n[\s\S]*?marp:\s*true/im.test(result)) {
-    // 模型偶尔会漏掉 Marp frontmatter，这里自动补齐，避免导出阶段才失败
-    result = `---\nmarp: true\ntheme: ${theme || "default"}\npaginate: true\n---\n\n${result}`;
-    warnings.push("模型返回缺少 Marp 文件头，已自动补齐 frontmatter。");
-  }
-  const separatorCount = result.match(/^---\s*$/gm)?.length ?? 0;
-  if (separatorCount < 3) {
-    errors.push("模型没有生成完整幻灯片分页，只返回了零散内容；请重新转换或更换模型。");
-  }
-  if (!/^#\s+/m.test(result)) {
-    errors.push("模型返回内容缺少幻灯片标题，不像可直接导出的 PPT 源码。");
-  }
-  if (/\b(graph|flowchart|sequenceDiagram|classDiagram|stateDiagram|erDiagram)\b/i.test(result) && !/```mermaid/i.test(result)) {
-    errors.push("检测到裸 Mermaid 图内容，但没有使用 ```mermaid 代码块包裹，Marp 渲染可能失败。");
-  }
-  return { content: result, warnings, errors };
-}
-
-function getErrorMessage(err: unknown): string {
-  if (err instanceof Error) return err.message;
-  return String(err);
-}
-
-function getApiErrorField(err: unknown, field: string): unknown {
-  if (!err || typeof err !== "object") return undefined;
-  const record = err as Record<string, unknown>;
-  if (record[field] !== undefined) return record[field];
-  const nested = record.error;
-  if (nested && typeof nested === "object") {
-    return (nested as Record<string, unknown>)[field];
-  }
-  return undefined;
-}
-
-function formatConvertError(err: unknown): string {
-  const message = getErrorMessage(err);
-  const status = getApiErrorField(err, "status") ?? getApiErrorField(err, "statusCode");
-  const code = getApiErrorField(err, "code");
-  const type = getApiErrorField(err, "type");
-  const statusText = typeof status === "number" || typeof status === "string" ? String(status) : "";
-  const codeText = typeof code === "string" ? code : "";
-  const typeText = typeof type === "string" ? type : "";
-  const meta = [statusText && `HTTP ${statusText}`, codeText && `code=${codeText}`, typeText && `type=${typeText}`]
-    .filter(Boolean)
-    .join(", ");
-  const haystack = `${statusText} ${codeText} ${typeText} ${message}`;
-
-  // 429 通常来自供应商侧限流或额度不足，优先提示用户检查账号和模型配额
-  if (/429|rate.?limit|quota|insufficient_quota|too many requests/i.test(haystack)) {
-    return `供应商返回 429：请求被限流或额度不足。请检查 API 余额/免费额度、模型权限、请求频率，或切换模型/供应商。原始错误：${message}${meta ? `（${meta}）` : ""}`;
-  }
-  if (/401|unauthorized|invalid.?api.?key/i.test(haystack)) {
-    return `供应商认证失败：请检查 API Key、Base URL 和模型所属供应商是否匹配。原始错误：${message}${meta ? `（${meta}）` : ""}`;
-  }
-  if (/403|forbidden|permission/i.test(haystack)) {
-    return `供应商拒绝访问：当前 API Key 可能没有该模型权限，或账号未开通对应服务。原始错误：${message}${meta ? `（${meta}）` : ""}`;
-  }
-  if (/failed to fetch|networkerror|cors|load failed/i.test(message)) {
-    return `${message}。当前 Web 预览是浏览器直连接口，可能被供应商 CORS 策略拦截；请使用桌面 Electron 模式，或确认供应商允许浏览器跨域调用。`;
-  }
-  return meta ? `${message}（${meta}）` : message;
 }
 
 function loadConfig(): Config {
@@ -254,6 +149,10 @@ export default function App() {
   const [exportResults, setExportResults] = useState<Record<string, { success: boolean; file?: string }>>({});
   const [convertProgress, setConvertProgress] = useState<ConvertProgress>(initialConvertProgress);
   const [progressTick, setProgressTick] = useState(Date.now());
+  // 导出目录授权完成前禁止写文件，避免启动竞态导致“未授权”误报
+  const [outputDirReady, setOutputDirReady] = useState(!isElectron || !loadConfig().outputDir);
+  // 输入 Markdown 被手动修改后，提示用户需要重新转换
+  const [inputDirty, setInputDirty] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const { toasts, show: toast } = useToast();
 
@@ -266,14 +165,31 @@ export default function App() {
 
   // 检查 Node.js / npx 环境，并重新登记本地保存的导出目录
   useEffect(() => {
-    if (isElectron && electronAPI) {
-      electronAPI.checkNode().then(setNodeInfo);
-      if (config.outputDir) {
-        electronAPI.authorizeOutputDir(config.outputDir).then((ok) => {
-          if (!ok) toast("已保存的导出目录不可用，请重新选择", "error");
-        });
-      }
+    const api = electronAPI;
+    if (!isElectron || !api) {
+      setOutputDirReady(true);
+      return;
     }
+
+    api.checkNode().then(setNodeInfo);
+
+    let cancelled = false;
+    const syncOutputDir = async () => {
+      if (!config.outputDir) {
+        if (!cancelled) setOutputDirReady(true);
+        return;
+      }
+      if (!cancelled) setOutputDirReady(false);
+      const ok = await api.authorizeOutputDir(config.outputDir);
+      if (cancelled) return;
+      setOutputDirReady(ok);
+      if (!ok) toast("已保存的导出目录不可用，请重新选择", "error");
+    };
+    syncOutputDir();
+
+    return () => {
+      cancelled = true;
+    };
   }, [config.outputDir, toast]);
 
   // 转换中持续刷新耗时显示，让用户知道请求仍在进行
@@ -290,9 +206,50 @@ export default function App() {
     setMarpContent("");
     setSavedMarpPath("");
     setExportResults({});
+    setInputDirty(false);
     setConvertProgress(initialConvertProgress());
     toast(`已加载：${name}`, "success");
   }, [toast]);
+
+  // 手动编辑输入 Markdown 时，清空旧结果，避免导出过期内容
+  const handleMdChange = (value: string) => {
+    setMdContent(value);
+    if (marpContent || convertProgress.stage !== "idle") {
+      setMarpContent("");
+      setSavedMarpPath("");
+      setExportResults({});
+      setConvertProgress(initialConvertProgress());
+      setInputDirty(true);
+    }
+  };
+
+  // 手动编辑 Marp 源码后，重新做本地质量检查，允许用户修复后导出
+  const handleMarpChange = (value: string) => {
+    setMarpContent(value);
+    setSavedMarpPath("");
+    setExportResults({});
+    const normalized = normalizeMarpContent(value, config.theme);
+    if (normalized.errors.length > 0) {
+      setConvertProgress((current) => ({
+        ...current,
+        stage: "error",
+        message: "当前源码仍未通过质量检查，请继续修改或重新转换。",
+        warnings: normalized.warnings,
+        error: normalized.errors.join(" "),
+        finishedAt: Date.now(),
+      }));
+      return;
+    }
+    setConvertProgress((current) => ({
+      ...current,
+      stage: "success",
+      message: "已根据你的手动修改通过质量检查，可以导出。",
+      warnings: normalized.warnings,
+      error: undefined,
+      finishedAt: Date.now(),
+      percent: 100,
+    }));
+  };
 
   // Electron 文件打开对话框
   const handleOpenFile = async () => {
@@ -346,6 +303,7 @@ export default function App() {
     setMarpContent("");
     setSavedMarpPath("");
     setExportResults({});
+    setInputDirty(false);
     setConvertProgress({
       stage: "preparing",
       message: "正在准备请求参数...",
@@ -355,6 +313,10 @@ export default function App() {
     });
 
     try {
+      if (isElectron && config.outputDir && !outputDirReady) {
+        throw new Error("导出目录仍在授权中，请稍候再试，或重新选择导出目录");
+      }
+
       let result = "";
       updateConvertProgress({
         stage: "requesting",
@@ -387,7 +349,7 @@ export default function App() {
             { role: "user", content: mdContent },
           ],
           temperature: 0.7,
-          max_tokens: 4096,
+          max_tokens: DEFAULT_MAX_TOKENS,
         });
         result = cleanupMarpContent(resp.choices[0]?.message?.content ?? "");
       }
@@ -505,20 +467,17 @@ export default function App() {
   const handleExport = async (format: ExportFormat) => {
     if (!isElectron || !electronAPI) { toast("导出功能仅在桌面版中可用", "info"); return; }
     if (!marpContent) { toast("请先完成转换", "error"); return; }
-    if (convertProgress.stage === "error") { toast("当前生成结果未通过质量检查，请重新转换后再导出", "error"); return; }
+    if (convertProgress.stage === "error") { toast("当前生成结果未通过质量检查，请继续修改或重新转换后再导出", "error"); return; }
     if (!config.outputDir) { toast("请先选择输出目录", "error"); return; }
+    if (!outputDirReady) { toast("导出目录仍在授权中，请稍候再试", "error"); return; }
     if (!nodeInfo?.available) { toast("未检测到 Node.js 或 npx，请先安装 Node.js", "error"); return; }
 
     setExporting(format);
     try {
-      // 确保有保存的临时文件，写入失败时会进入统一错误提示
-      let marpPath = savedMarpPath;
-      if (!marpPath) {
-        const tmpPath = buildOutputMarpPath(config.outputDir, fileName);
-        await electronAPI.writeFile(tmpPath, marpContent);
-        setSavedMarpPath(tmpPath);
-        marpPath = tmpPath;
-      }
+      // 每次导出都先把当前编辑器内容写回磁盘，避免导出过期文件
+      const marpPath = savedMarpPath || buildOutputMarpPath(config.outputDir, fileName);
+      await electronAPI.writeFile(marpPath, marpContent);
+      setSavedMarpPath(marpPath);
 
       const result = await electronAPI.marpExport({
         marpFilePath: marpPath,
@@ -540,7 +499,15 @@ export default function App() {
     }
   };
 
-  const configOk = config.apiKey.trim() && config.model.trim();
+  const configOk = Boolean(config.apiKey.trim() && config.model.trim());
+  const canExport = Boolean(
+    marpContent &&
+    convertProgress.stage !== "error" &&
+    config.outputDir &&
+    outputDirReady &&
+    nodeInfo?.available &&
+    exporting === null
+  );
   const progressElapsedSeconds = convertProgress.startedAt
     ? Math.max(0, Math.round(((convertProgress.finishedAt ?? progressTick) - convertProgress.startedAt) / 1000))
     : 0;
@@ -806,12 +773,22 @@ export default function App() {
                 </div>
               </div>
             ) : (
-              <textarea
-                className="code-editor"
-                value={mdContent}
-                onChange={(e) => setMdContent(e.target.value)}
-                spellCheck={false}
-              />
+              <>
+                {inputDirty && (
+                  <div style={{
+                    padding: "8px 10px", borderRadius: "var(--radius)", fontSize: 11.5,
+                    background: "var(--warning-bg)", color: "var(--warning)",
+                  }}>
+                    输入内容已修改，旧的 Marp 结果已清空，请重新转换后再导出。
+                  </div>
+                )}
+                <textarea
+                  className="code-editor"
+                  value={mdContent}
+                  onChange={(e) => handleMdChange(e.target.value)}
+                  spellCheck={false}
+                />
+              </>
             )}
 
             {/* 转换按钮 */}
@@ -933,7 +910,7 @@ export default function App() {
               <textarea
                 className="code-editor"
                 value={marpContent}
-                onChange={(e) => setMarpContent(e.target.value)}
+                onChange={(e) => handleMarpChange(e.target.value)}
                 spellCheck={false}
               />
             )}
@@ -954,6 +931,11 @@ export default function App() {
                       ⚠ 请先在左侧选择导出目录
                     </span>
                   )}
+                  {isElectron && config.outputDir && !outputDirReady && (
+                    <span style={{ fontSize: 11, color: "var(--warning)", marginLeft: 4 }}>
+                      ⚠ 导出目录授权中...
+                    </span>
+                  )}
                 </div>
 
                 {isElectron ? (
@@ -972,7 +954,7 @@ export default function App() {
                               color: result?.success ? "var(--success)" : undefined,
                             }}
                             onClick={() => handleExport(fmt)}
-                            disabled={exporting !== null || !config.outputDir || convertProgress.stage === "error"}
+                            disabled={!canExport}
                           >
                             {exporting === fmt ? <Icon.Spin /> : result?.success ? <Icon.Check /> : <Icon.Download />}
                             {fmt.toUpperCase()}
@@ -994,12 +976,12 @@ export default function App() {
                     })}
                   </div>
                 ) : (
-                  // Web：显示命令行提示
+                  // Web：显示命令行提示，文件名使用当前生成结果
                   <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
                     {[
-                      { label: "PDF", cmd: "npx @marp-team/marp-cli@latest 输出.md --pdf" },
-                      { label: "PPTX", cmd: "npx @marp-team/marp-cli@latest 输出.md --pptx" },
-                      { label: "HTML", cmd: "npx @marp-team/marp-cli@latest 输出.md --html" },
+                      { label: "PDF", cmd: `npx @marp-team/marp-cli@latest ${getMarpFileName(fileName)} --pdf` },
+                      { label: "PPTX", cmd: `npx @marp-team/marp-cli@latest ${getMarpFileName(fileName)} --pptx` },
+                      { label: "HTML", cmd: `npx @marp-team/marp-cli@latest ${getMarpFileName(fileName)} --html` },
                     ].map((item) => (
                       <div key={item.label} style={{ display: "flex", alignItems: "center", gap: 8 }}>
                         <span style={{ fontSize: 11, color: "var(--text-muted)", width: 36, flexShrink: 0 }}>{item.label}</span>

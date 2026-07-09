@@ -5,6 +5,12 @@ import fs from "fs";
 import os from "os";
 import { promisify } from "util";
 import OpenAI from "openai";
+import {
+  cleanupMarpContent,
+  DEFAULT_MAX_TOKENS,
+  formatConvertError,
+  MARP_PROMPT,
+} from "../shared/marp";
 
 const execAsync = promisify(exec);
 const isDev = process.env.NODE_ENV === "development" || !app.isPackaged;
@@ -14,26 +20,8 @@ const EXPORT_FORMATS = new Set<ExportFormat>(["pdf", "pptx", "html"]);
 const MARP_THEMES = new Set(["default", "gaia", "uncover"]);
 const allowedOutputDirs = new Set<string>();
 const allowedFiles = new Set<string>();
-
-// 与渲染进程保持一致的 Marp 转换 Prompt，主进程发起请求可绕开浏览器 CORS 限制
-const MARP_PROMPT = `你是一个专业的 PPT 演示文稿策划专家和 Markdown 工程师。
-将用户提供的 Markdown 文档转换为可以直接使用 Marp 渲染的高质量演示文稿源码。
-
-【Marp 基础语法】
-- 文件头部必须包含 YAML frontmatter（marp: true, theme: default, paginate: true）
-- 使用 --- 分隔每一页幻灯片
-- Mermaid 必须写成 \`\`\`mermaid 代码块，不能直接输出裸 graph/flowchart 文本
-
-【内容转换策略】
-1. 结构化重构：H1/H2 作为幻灯片标题；标题必须是洞察或结论；每页 3-5 个核心要点；总页数 10-15 页
-2. 精准可视化：流程/架构关系用 Mermaid 代码块；数据对比保留 Markdown 表格
-3. 代码展示：保留关键代码片段，过长时保留核心逻辑并用注释省略
-4. 视觉节奏：首页封面（大标题+副标题）；第二页目录；最后一页 Q&A
-
-【输出要求】
-- 只输出 Marp Markdown 源码，不要包含任何解释性文字，不要用代码块包裹整个文档
-- 必须生成完整幻灯片，而不是摘要、提纲或单个 Mermaid 图
-- 每页必须有标题，至少 8 页，使用 --- 分页。`;
+// 首次 npx 下载 Marp CLI 可能较慢，给足超时避免界面永久转圈
+const MARP_EXPORT_TIMEOUT_MS = 5 * 60 * 1000;
 
 let mainWindow: BrowserWindow | null = null;
 
@@ -84,56 +72,6 @@ function assertAllowedOutputDir(outputDir: string) {
 // 临时文件清理不能影响主流程，所以这里吞掉清理失败
 function cleanupFile(filePath: string) {
   try { fs.unlinkSync(filePath); } catch {}
-}
-
-function cleanupMarpContent(content: string): string {
-  let result = content.trim();
-  // 兼容不同模型返回的代码块包裹格式，统一提取纯 Marp 文本
-  result = result.replace(/^```(?:markdown|md|marp)?\s*/i, "");
-  if (result.endsWith("```")) result = result.slice(0, -3).trimEnd();
-  return result;
-}
-
-function getErrorMessage(err: unknown): string {
-  if (err instanceof Error) return err.message;
-  return String(err);
-}
-
-function getApiErrorField(err: unknown, field: string): unknown {
-  if (!err || typeof err !== "object") return undefined;
-  const record = err as Record<string, unknown>;
-  if (record[field] !== undefined) return record[field];
-  const nested = record.error;
-  if (nested && typeof nested === "object") {
-    return (nested as Record<string, unknown>)[field];
-  }
-  return undefined;
-}
-
-function formatProviderError(err: unknown): string {
-  const message = getErrorMessage(err);
-  const status = getApiErrorField(err, "status") ?? getApiErrorField(err, "statusCode");
-  const code = getApiErrorField(err, "code");
-  const type = getApiErrorField(err, "type");
-  const statusText = typeof status === "number" || typeof status === "string" ? String(status) : "";
-  const codeText = typeof code === "string" ? code : "";
-  const typeText = typeof type === "string" ? type : "";
-  const meta = [statusText && `HTTP ${statusText}`, codeText && `code=${codeText}`, typeText && `type=${typeText}`]
-    .filter(Boolean)
-    .join(", ");
-  const haystack = `${statusText} ${codeText} ${typeText} ${message}`;
-
-  // 429 通常代表限流或额度不足，直接给出可操作排查方向
-  if (/429|rate.?limit|quota|insufficient_quota|too many requests/i.test(haystack)) {
-    return `供应商返回 429：请求被限流或额度不足。请检查 API 余额/免费额度、模型是否有权限、请求频率是否过高，或切换到更低成本/更高额度的模型。原始错误：${message}${meta ? `（${meta}）` : ""}`;
-  }
-  if (/401|unauthorized|invalid.?api.?key/i.test(haystack)) {
-    return `供应商认证失败：请检查 API Key 是否正确、是否粘贴了多余空格，以及 Base URL 是否匹配该 Key。原始错误：${message}${meta ? `（${meta}）` : ""}`;
-  }
-  if (/403|forbidden|permission/i.test(haystack)) {
-    return `供应商拒绝访问：当前 API Key 可能没有该模型权限，或账号未开通对应服务。原始错误：${message}${meta ? `（${meta}）` : ""}`;
-  }
-  return meta ? `${message}（${meta}）` : message;
 }
 
 function createWindow() {
@@ -281,7 +219,7 @@ ipcMain.handle(
           { role: "user", content: markdown },
         ],
         temperature: 0.7,
-        max_tokens: 4096,
+        max_tokens: DEFAULT_MAX_TOKENS,
       });
 
       const content = cleanupMarpContent(resp.choices[0]?.message?.content ?? "");
@@ -290,7 +228,7 @@ ipcMain.handle(
       }
       return { success: true, content };
     } catch (err: unknown) {
-      return { success: false, error: formatProviderError(err) };
+      return { success: false, error: formatConvertError(err) };
     }
   }
 );
@@ -348,6 +286,24 @@ ipcMain.handle(
         const proc = spawn(npxCommand, args, { shell: false });
         let stdout = "";
         let stderr = "";
+        let settled = false;
+
+        const finish = (result: { success: boolean; outputFile?: string; error?: string }) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timeout);
+          cleanupFile(tmpFile);
+          resolve(result);
+        };
+
+        // 超时后主动结束进程，避免首次下载或卡死时界面永久等待
+        const timeout = setTimeout(() => {
+          proc.kill();
+          finish({
+            success: false,
+            error: `导出超时（${Math.round(MARP_EXPORT_TIMEOUT_MS / 1000)} 秒）。请检查网络，或手动执行一次 npx @marp-team/marp-cli@latest --version 预热缓存。`,
+          });
+        }, MARP_EXPORT_TIMEOUT_MS);
 
         proc.stdout.on("data", (data: Buffer) => {
           stdout += data.toString();
@@ -358,20 +314,16 @@ ipcMain.handle(
         });
 
         proc.on("close", (code) => {
-          // 清理临时文件
-          cleanupFile(tmpFile);
-
           if (code === 0) {
             rememberFile(outputFile);
-            resolve({ success: true, outputFile });
+            finish({ success: true, outputFile });
           } else {
-            resolve({ success: false, error: stderr || stdout || `退出码 ${code}` });
+            finish({ success: false, error: stderr || stdout || `退出码 ${code}` });
           }
         });
 
         proc.on("error", (err) => {
-          cleanupFile(tmpFile);
-          resolve({ success: false, error: err.message });
+          finish({ success: false, error: err.message });
         });
       }
     );

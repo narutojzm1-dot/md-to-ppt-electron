@@ -44,8 +44,19 @@ pnpm dev
 ### 启动完整 Electron 开发模式
 
 ```bash
-# 自动启动 Vite，并在开发服务器就绪后启动 Electron
+# 会先编译 Electron 主进程，再启动 Vite，等待就绪后启动 Electron
 pnpm electron:dev
+```
+
+### 网页冒烟测试
+
+```bash
+# 终端 1
+pnpm dev
+
+# 终端 2（首次需要安装浏览器）
+pnpm exec playwright install chromium
+pnpm test:web
 ```
 
 ## 打包发布
@@ -67,27 +78,35 @@ pnpm electron:build
 2. **选择导出目录**：点击"选择输出目录"按钮，指定 PDF/PPTX/HTML 的保存位置
 3. **打开文件**：点击"打开文件"按钮，选择本地 Markdown 文件
 4. **一键转换**：点击"一键转换为 Marp PPT"，等待 AI 生成 Marp 源码
-5. **导出文件**：在右侧点击 PDF / PPTX / HTML 按钮，应用自动调用 Marp CLI 完成渲染
+5. **检查结果**：右侧显示的是 Marp Markdown 源码，不是最终 PPT；通过质量检查后再导出
+6. **导出文件**：在右侧点击 PDF / PPTX / HTML 按钮，应用自动调用 Marp CLI 完成渲染
 
 ## 注意事项
 
-- 导出功能需要本地安装 Node.js（应用启动时会自动检测）
-- 首次导出时，npx 会自动下载 Marp CLI，需要网络连接
+- 导出功能需要本地安装 Node.js（应用启动时会自动检测 Node 和 npx）
+- 首次导出时，npx 会自动下载 Marp CLI，需要网络连接；超时时间为 5 分钟
 - API Key 仅保存在本地 localStorage，不会上传到任何服务器
+- 如果打包后出现白屏，请确认使用了最新构建（Vite `base: './'`）
+- 如果桌面应用检测不到 Node，请确认系统 PATH 中包含 `node` / `npx`（GUI 应用有时拿不到终端里的 PATH）
 
 ## 项目结构
 
 ```
-md-to-ppt-electron/
+.
 ├── electron/
 │   ├── main.ts          # Electron 主进程（文件系统、Marp CLI、IPC）
 │   └── preload.ts       # 预加载脚本（安全暴露 API）
+├── shared/
+│   └── marp.ts          # 共享 Prompt、校验与错误格式化
 ├── src/
 │   ├── App.tsx          # 主界面（三栏布局）
 │   ├── lib/
 │   │   └── electronAPI.ts  # Electron API 封装
 │   ├── main.tsx         # React 入口
 │   └── index.css        # 全局样式
+├── scripts/
+│   ├── electron-dev.mjs # Electron 开发启动脚本
+│   └── ui-smoke-test.mjs # Web 冒烟测试
 ├── dist/                # Vite 构建产物
 ├── dist-electron/       # Electron 主进程编译产物
 ├── release/             # electron-builder 打包产物

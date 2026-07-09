@@ -5,9 +5,14 @@
   "main": "dist-electron/electron/main.js",
   "author": "MD to PPT",
   "license": "MIT",
+  "engines": {
+    "node": ">=18",
+    "pnpm": ">=8"
+  },
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "electron:compile": "tsc -p tsconfig.electron.json",
     "electron:dev": "node scripts/electron-dev.mjs",
     "electron:build": "vite build && tsc -p tsconfig.electron.json && electron-builder",
     "test:web": "node scripts/ui-smoke-test.mjs",
@@ -49,9 +54,7 @@
     "postcss": "^8.5.8",
     "tailwindcss": "^4.2.2",
     "typescript": "^6.0.2",
-    "vite": "^8.0.3",
-    "vite-plugin-electron": "^0.29.1",
-    "vite-plugin-electron-renderer": "^0.14.6"
+    "vite": "^8.0.3"
   },
   "dependencies": {
     "openai": "^6.33.0",

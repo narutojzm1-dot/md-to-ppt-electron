@@ -58,13 +58,27 @@ async function waitForVite() {
 process.on("SIGINT", () => cleanup(0));
 process.on("SIGTERM", () => cleanup(0));
 
-// 开发模式下先启动 Vite 服务，等待端口就绪后再启动 Electron，避免白屏或连接失败
-const vite = run("pnpm", ["dev"]);
-vite.once("exit", (code) => {
-  if (!shuttingDown) cleanup(code ?? 1);
-});
+// 先编译 Electron 主进程，再启动 Vite；否则 electron . 会找不到 dist-electron
+function compileElectron() {
+  return new Promise((resolve, reject) => {
+    const tsc = run("pnpm", ["exec", "tsc", "-p", "tsconfig.electron.json"]);
+    tsc.once("exit", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`Electron 主进程编译失败，退出码 ${code}`));
+    });
+    tsc.once("error", reject);
+  });
+}
 
 try {
+  await compileElectron();
+
+  // 开发模式下先启动 Vite 服务，等待端口就绪后再启动 Electron，避免白屏或连接失败
+  const vite = run("pnpm", ["dev"]);
+  vite.once("exit", (code) => {
+    if (!shuttingDown) cleanup(code ?? 1);
+  });
+
   await waitForVite();
   const electron = run("electron", ["."], {
     env: {
